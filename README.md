@@ -32,3 +32,9 @@ python main.py
 ```
 
 ملف `template.docx` الموجود في المشروع نموذج فارغ؛ بدّلو بنموذجك الخاص.
+
+## ملف exe (بلا Python)
+- **من GitHub:** تبويب Actions ← "Build Windows exe" ← آخر تشغيل ← Artifacts ← `TeacherFileManager-exe` (أو "Run workflow" لتشغيلو يدويا).
+- **على البيسي:** شغّل `build.bat` (يحتاج Python مرة وحدة للبناء)، والنتيجة في `dist\TeacherFileManager.exe`.
+
+النموذج `template.docx` مدمج داخل exe، وإذا حطيت نسخة في المجلد الرئيسي تتقدّم عليه.

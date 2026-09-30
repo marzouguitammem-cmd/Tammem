@@ -118,8 +118,15 @@ def validate_name(name):
 
 
 def find_template(root):
-    here = os.path.dirname(os.path.abspath(__file__))
-    for folder in (root, here):
+    folders = [root]
+    if getattr(sys, "frozen", False):
+        folders.append(os.path.dirname(sys.executable))  # بجنب ملف exe
+        folders.append(getattr(sys, "_MEIPASS", ""))  # النموذج المدمج داخل exe
+    else:
+        folders.append(os.path.dirname(os.path.abspath(__file__)))
+    for folder in folders:
+        if not folder:
+            continue
         candidate = os.path.join(folder, TEMPLATE_NAME)
         if os.path.isfile(candidate):
             return candidate
