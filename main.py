@@ -6,13 +6,15 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
-from PyQt6.QtCore import QFile, QSettings, Qt, QTimer, QUrl
+from PyQt6.QtCore import QDate, QFile, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -27,13 +29,21 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
+    QSpinBox,
     QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+try:  # مكتبة تعمير القوالب (python-docx)
+    import docx
+    from docx.oxml.ns import qn
+except ImportError:  # pragma: no cover
+    docx = None
 
 APP_NAME = "مدير ملفات المعلم"
 TEMPLATE_NAME = "template.docx"
@@ -133,23 +143,234 @@ def find_template(root):
     return None
 
 
+# ---------- تعمير النموذج (الكلمات المعلّمة) ----------
+PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+_INVISIBLE = re.compile("[​-‏‪-‮⁦-⁩﻿]")
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+
+
+def placeholder_key(text):
+    return normalize(_INVISIBLE.sub("", text).strip())
+
+
+def fill_paragraph(p_el, mapping):
+    """يبدّل {{...}} في فقرة. الكلمة المعلّمة ممكن تكون مقسومة على عدة runs:
+    القيمة الجديدة تتكتب في أول run (فتبقى تنسيقاتو) والبقية تتفرّغ من الجزء المعلّم."""
+    nodes = list(p_el.iter(qn("w:t")))
+    originals = [t.text or "" for t in nodes]
+    full = "".join(originals)
+    if "{{" not in full:
+        return
+    matches = [m for m in PLACEHOLDER_RE.finditer(full) if placeholder_key(m.group(1)) in mapping]
+    if not matches:
+        return
+    starts, pos = [], 0
+    for text in originals:
+        starts.append(pos)
+        pos += len(text)
+    texts = list(originals)
+    for m in reversed(matches):  # من الآخر باش الإزاحات ما تتلخبطش
+        start, end = m.span()
+        value = mapping[placeholder_key(m.group(1))]
+        first = True
+        for i, original in enumerate(originals):
+            a, b = starts[i], starts[i] + len(original)
+            if not original or b <= start or a >= end:
+                continue
+            lo, hi = max(start, a) - a, min(end, b) - a
+            texts[i] = texts[i][:lo] + (value if first else "") + texts[i][hi:]
+            first = False
+    for node, new, old in zip(nodes, texts, originals):
+        if new != old:
+            node.text = new
+            node.set(XML_SPACE, "preserve")
+
+
+def fill_docx(src, dst, values):
+    """ينسخ النموذج src إلى dst ويعمّر الكلمات المعلّمة في النص والجداول والـ header والـ footer."""
+    if docx is None:
+        raise RuntimeError("مكتبة python-docx غير مثبتة. نفّذ: pip install python-docx")
+    mapping = {placeholder_key(k): v for k, v in values.items()}
+    document = docx.Document(src)
+    roots = [document.element.body]
+    for section in document.sections:
+        for part in (
+            section.header, section.first_page_header, section.even_page_header,
+            section.footer, section.first_page_footer, section.even_page_footer,
+        ):
+            if not part.is_linked_to_previous:
+                roots.append(part._element)
+    for root in roots:
+        # iter على كل w:p يغطي الفقرات والجداول (حتى المتداخلة) وصناديق النص
+        for p_el in list(root.iter(qn("w:p"))):
+            fill_paragraph(p_el, mapping)
+    document.save(dst)
+
+
+def auto_file_name(subject, lesson, week):
+    parts = [subject.strip(), lesson.strip(), f"أسبوع {week}"]
+    name = " - ".join(p for p in parts if p)
+    name = re.sub(r"\s+", " ", INVALID_CHARS.sub(" ", name))
+    return name.strip(" .")
+
+
+# ---------- تحويل docx إلى PDF ----------
+class ConversionError(Exception):
+    """فشل تحويل ملف معيّن."""
+
+
+class NoConverterError(ConversionError):
+    """ما فما حتى أداة تحويل تخدم (لا Word ولا LibreOffice)."""
+
+
+NO_CONVERTER_MESSAGE = (
+    "ما نجمتش نحوّل الملف لأنو ما لقيت برنامج يعمل التحويل.\n\n"
+    "لازم تثبّت واحد من هاذم:\n"
+    "• Microsoft Word (الأفضل، إذا عندك Office)\n"
+    "• LibreOffice (مجاني): https://www.libreoffice.org/download\n\n"
+    "بعد التثبيت عاود حاول."
+)
+
+
+def find_libreoffice():
+    for name in ("soffice", "soffice.exe", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if base:
+            candidate = os.path.join(base, "LibreOffice", "program", "soffice.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def convert_with_word(src, dst):
+    import docx2pdf  # يخدم كان Microsoft Word مثبّت
+
+    com = None
+    try:  # التحويل يتم في thread، وCOM يحتاج تهيئة في كل thread
+        import pythoncom
+
+        pythoncom.CoInitialize()
+        com = pythoncom
+    except ImportError:
+        pass
+    try:
+        docx2pdf.convert(src, dst)
+    finally:
+        if com is not None:
+            com.CoUninitialize()
+
+
+def convert_with_libreoffice(src, dst, soffice):
+    out_dir = os.path.dirname(dst)
+    with tempfile.TemporaryDirectory() as tmp:
+        profile = QUrl.fromLocalFile(os.path.join(tmp, "profile")).toString()  # باش ما يتعارضش مع LibreOffice مفتوح
+        cmd = [soffice, f"-env:UserInstallation={profile}", "--headless", "--convert-to", "pdf", "--outdir", tmp, src]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(cmd, capture_output=True, timeout=300, creationflags=flags)
+        produced = os.path.join(tmp, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if result.returncode != 0 or not os.path.isfile(produced):
+            details = result.stderr.decode("utf-8", "replace").strip()
+            raise ConversionError(f"LibreOffice فشل في التحويل. {details}".strip())
+        shutil.move(produced, dst)
+    return out_dir
+
+
+class PdfConverter:
+    """يجرّب Word (docx2pdf) ثم LibreOffice، ويتذكر الطريقة اللي نجحت."""
+
+    def __init__(self):
+        self.order = ["word", "libreoffice"]
+
+    def convert(self, src, dst):
+        errors = []
+        for backend in list(self.order):
+            try:
+                if backend == "word":
+                    convert_with_word(src, dst)
+                else:
+                    soffice = find_libreoffice()
+                    if not soffice:
+                        errors.append("LibreOffice: غير مثبّت")
+                        continue
+                    convert_with_libreoffice(src, dst, soffice)
+                if not os.path.isfile(dst):
+                    raise ConversionError("ما تكوّن ملف PDF.")
+            except Exception as e:  # noqa: BLE001 - كل فشل يجرّب الطريقة الموالية
+                label = "Word" if backend == "word" else "LibreOffice"
+                errors.append(f"{label}: {type(e).__name__}: {e}".strip())
+                continue
+            self.order.remove(backend)
+            self.order.insert(0, backend)
+            return
+        if not find_libreoffice():
+            error = NoConverterError(NO_CONVERTER_MESSAGE)
+        else:
+            error = ConversionError("فشل التحويل بكل الطرق المتاحة.")
+        error.details = "\n".join(errors)
+        raise error
+
+
+class PdfWorker(QThread):
+    """يحوّل قائمة ملفات docx في thread منفصل."""
+
+    progress = pyqtSignal(int, int, str)  # المنجز، المجموع، اسم الملف الحالي
+    finished_all = pyqtSignal(list, list, str)  # [pdf], [(ملف, خطأ)], تفاصيل «ما فما أداة تحويل»
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = paths
+
+    def run(self):
+        converter = PdfConverter()
+        done, failed, no_converter = [], [], ""
+        for i, src in enumerate(self.paths):
+            if self.isInterruptionRequested():
+                break
+            self.progress.emit(i, len(self.paths), os.path.basename(src))
+            dst = os.path.splitext(src)[0] + ".pdf"
+            try:
+                converter.convert(src, dst)
+                done.append(dst)
+            except NoConverterError as e:
+                no_converter = e.details or "—"
+                break
+            except Exception as e:  # noqa: BLE001
+                details = getattr(e, "details", "")
+                failed.append((src, f"{e}\n{details}".strip()))
+        self.finished_all.emit(done, failed, no_converter)
+
+
 class NewMemoDialog(QDialog):
     def __init__(self, root, initial_section=None, initial_subject=None, parent=None):
         super().__init__(parent)
         self.root = root
+        self.name_manual = False
         self.setWindowTitle("مذكرة جديدة")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(420)
 
         self.section_box = QComboBox()
         self.subject_box = QComboBox()
+        self.lesson_edit = QLineEdit()
+        self.lesson_edit.setPlaceholderText("مثال: الجمع والطرح")
+        self.week_spin = QSpinBox()
+        self.week_spin.setRange(1, 60)
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("مثال: مذكرة الدرس 1")
+        self.name_edit.setPlaceholderText("يتكوّن أوتوماتيك، وتنجم تبدلو")
 
         form = QFormLayout()
         form.addRow("القسم:", self.section_box)
         form.addRow("المادة:", self.subject_box)
-        form.addRow("اسم المذكرة:", self.name_edit)
+        form.addRow("عنوان الدرس:", self.lesson_edit)
+        form.addRow("رقم الأسبوع:", self.week_spin)
+        form.addRow("التاريخ:", self.date_edit)
+        form.addRow("اسم الملف:", self.name_edit)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -170,12 +391,24 @@ class NewMemoDialog(QDialog):
         self.load_subjects(self.section_box.currentText())
         if initial_subject:
             self.subject_box.setCurrentText(initial_subject)
-        self.name_edit.setFocus()
+
+        self.subject_box.currentTextChanged.connect(self.update_auto_name)
+        self.lesson_edit.textChanged.connect(self.update_auto_name)
+        self.week_spin.valueChanged.connect(self.update_auto_name)
+        self.name_edit.textEdited.connect(lambda text: setattr(self, "name_manual", bool(text.strip())))
+        self.update_auto_name()
+        self.lesson_edit.setFocus()
 
     def load_subjects(self, section):
         self.subject_box.clear()
         if section:
             self.subject_box.addItems(subfolders(os.path.join(self.root, section)))
+
+    def update_auto_name(self):
+        if not self.name_manual:
+            self.name_edit.setText(
+                auto_file_name(self.subject_box.currentText(), self.lesson_edit.text(), self.week_spin.value())
+            )
 
     def accept(self):
         section, subject = self.section_box.currentText(), self.subject_box.currentText()
@@ -196,6 +429,14 @@ class NewMemoDialog(QDialog):
         if os.path.exists(self.target):
             QMessageBox.warning(self, APP_NAME, "يوجد ملف بنفس الاسم في هذه المادة.")
             return
+        d = self.date_edit.date()
+        self.values = {
+            "القسم": section,
+            "المادة": subject,
+            "الدرس": self.lesson_edit.text().strip(),
+            "الأسبوع": str(self.week_spin.value()),
+            "التاريخ": f"{d.day():02d}/{d.month():02d}/{d.year()}",
+        }
         super().accept()
 
 
@@ -208,6 +449,8 @@ class MainWindow(QMainWindow):
         self.root = ""
         self.items = {}  # مسار -> عنصر الشجرة
         self.icons = QFileIconProvider()
+        self.pdf_worker = None
+        self.pdf_dialog = None
 
         self.build_ui()
         self.build_shortcuts()
@@ -248,6 +491,7 @@ class MainWindow(QMainWindow):
         self.tree = QTreeWidget()
         self.tree.setHeaderLabel("الأقسام ← المواد ← الملفات")
         self.tree.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.tree_menu)
         self.tree.itemExpanded.connect(self.on_expand)
@@ -255,6 +499,7 @@ class MainWindow(QMainWindow):
 
         self.results = QListWidget()
         self.results.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.results.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results.customContextMenuRequested.connect(self.results_menu)
         self.results.itemDoubleClicked.connect(lambda item: self.open_if_file(item.data(PATH_ROLE)))
@@ -497,6 +742,15 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     # ---------- القوائم (كليك يمين) ----------
+    def selected_docx(self):
+        """ملفات docx المحددة في القائمة النشطة."""
+        if self.stack.currentWidget() is self.results:
+            paths = [i.data(PATH_ROLE) for i in self.results.selectedItems()]
+        else:
+            paths = [i.data(0, PATH_ROLE) for i in self.tree.selectedItems()]
+        docs = [p for p in paths if p.lower().endswith(".docx") and os.path.isfile(p)]
+        return sorted(docs, key=natural_key)
+
     def show_menu(self, path, global_pos):
         if not path or not os.path.exists(path):
             return
@@ -504,6 +758,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         menu.addAction("فتح المجلد" if is_dir else "فتح", lambda: self.open_item(path))
+        docs = self.selected_docx()
+        if len(docs) > 1 and path in docs:
+            menu.addAction(f"تحويل الملفات المحددة إلى PDF ({len(docs)})", lambda: self.convert_to_pdf(docs))
+        elif path.lower().endswith(".docx") and os.path.isfile(path):
+            menu.addAction("تحويل إلى PDF", lambda: self.convert_to_pdf([path]))
         menu.addAction("إعادة تسمية", lambda: self.rename_item(path))
         menu.addAction("حذف", lambda: self.delete_item(path))
         menu.addSeparator()
@@ -514,15 +773,88 @@ class MainWindow(QMainWindow):
         item = self.tree.itemAt(pos)
         if item is None:
             return
-        self.tree.setCurrentItem(item)
+        if not item.isSelected():  # نحافظو على التحديد المتعدد
+            self.tree.setCurrentItem(item)
         self.show_menu(item.data(0, PATH_ROLE), self.tree.viewport().mapToGlobal(pos))
 
     def results_menu(self, pos):
         item = self.results.itemAt(pos)
         if item is None:
             return
-        self.results.setCurrentItem(item)
+        if not item.isSelected():
+            self.results.setCurrentItem(item)
         self.show_menu(item.data(PATH_ROLE), self.results.viewport().mapToGlobal(pos))
+
+    # ---------- تحويل إلى PDF ----------
+    def convert_to_pdf(self, paths):
+        if self.pdf_worker is not None and self.pdf_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "فما تحويل قيد التنفيذ، استنى يكمل.")
+            return
+        total = len(paths)
+        dlg = QProgressDialog("جاري التحويل إلى PDF...", "إلغاء", 0, 0 if total == 1 else total, self)
+        dlg.setWindowTitle("تحويل إلى PDF")
+        dlg.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        worker = PdfWorker(paths)
+        worker.progress.connect(self.on_pdf_progress)
+        worker.finished_all.connect(self.on_pdf_finished)
+        dlg.canceled.connect(worker.requestInterruption)  # يوقف بعد الملف الحالي
+        self.pdf_worker, self.pdf_dialog = worker, dlg
+        dlg.show()
+        worker.start()
+
+    def on_pdf_progress(self, done, total, name):
+        dlg = self.pdf_dialog
+        if dlg is None:
+            return
+        dlg.setLabelText(f"جاري تحويل: {name}" + (f"\n({done + 1} من {total})" if total > 1 else ""))
+        if total > 1:
+            dlg.setValue(done)
+
+    def on_pdf_finished(self, done, failed, no_converter):
+        dlg, worker = self.pdf_dialog, self.pdf_worker
+        self.pdf_dialog = self.pdf_worker = None
+        if dlg is not None:
+            dlg.canceled.disconnect()
+            dlg.close()
+        if worker is not None:
+            worker.wait()
+        self.refresh_all()
+        if no_converter:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("تحويل إلى PDF")
+            box.setText(NO_CONVERTER_MESSAGE)
+            box.setDetailedText(no_converter)
+            box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+            box.addButton("موافق", QMessageBox.ButtonRole.AcceptRole)
+            box.exec()
+            return
+        box = QMessageBox(self)
+        box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        box.setWindowTitle("تحويل إلى PDF")
+        if failed:
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(f"تم تحويل {len(done)} ملف، وفشل {len(failed)}.")
+            box.setDetailedText("\n\n".join(f"{os.path.basename(src)}:\n{err}" for src, err in failed))
+        elif done:
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText("تم التحويل بنجاح." if len(done) == 1 else f"تم تحويل {len(done)} ملفات بنجاح.")
+        else:
+            return  # أُلغي قبل تحويل أي ملف
+        open_btn = None
+        if len(done) == 1:
+            box.setInformativeText(done[0])
+            open_btn = box.addButton("فتح PDF", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("إغلاق", QMessageBox.ButtonRole.RejectRole)
+        if done:
+            self.select_path(done[0])
+        box.exec()
+        if open_btn is not None and box.clickedButton() is open_btn:
+            self.open_item(done[0])
 
     # ---------- مذكرة جديدة ----------
     def new_memo(self):
@@ -547,18 +879,47 @@ class MainWindow(QMainWindow):
         if not dlg.exec():
             return
         try:
-            shutil.copyfile(template, dlg.target)
-        except OSError as e:
-            QMessageBox.critical(self, APP_NAME, f"ما نجمتش ننسخ النموذج:\n{e}")
+            if docx is None:
+                shutil.copyfile(template, dlg.target)
+                QMessageBox.warning(
+                    self, APP_NAME,
+                    "مكتبة python-docx غير مثبتة، تم نسخ النموذج بدون تعمير الكلمات المعلّمة.\n"
+                    "نفّذ: pip install python-docx",
+                )
+            else:
+                fill_docx(template, dlg.target, dlg.values)
+        except Exception as e:  # noqa: BLE001 - ملف نموذج تالف، ملف مقفول...
+            if os.path.exists(dlg.target):
+                try:
+                    os.remove(dlg.target)
+                except OSError:
+                    pass
+            QMessageBox.critical(self, APP_NAME, f"ما نجمتش نكوّن المذكرة من النموذج:\n{e}")
             return
         self.search_edit.clear()
         self.refresh_all()
         self.select_path(dlg.target)
         self.statusBar().showMessage("تم إنشاء المذكرة.", 5000)
-        self.open_item(dlg.target)
+        if self.ask("مذكرة جديدة", "تم إنشاء المذكرة.\nتحب تفتح المذكرة توا؟", "نعم، افتحها", "لا"):
+            self.open_item(dlg.target)
+
+    def ask(self, title, text, yes_text, no_text):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        yes = box.addButton(yes_text, QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(no_text, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        return box.clickedButton() is yes
 
 
 def main():
+    for name in ("stdout", "stderr"):  # exe بدون نافذة أوامر: sys.stdout يكون None وتنكسر مكتبات تكتب فيه
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
