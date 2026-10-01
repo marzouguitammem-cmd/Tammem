@@ -39,7 +39,7 @@ import re, sys, html
 x = open("ui.xml", encoding="utf-8").read()
 for n in re.findall(r"<node [^>]*>", x):
     d = html.unescape(re.search(r'content-desc="([^"]*)"', n).group(1)) + " " + html.unescape(re.search(r' text="([^"]*)"', n).group(1))
-    if re.search(sys.argv[1], d):
+    if re.search(sys.argv[1], d, re.S):
         b = list(map(int, re.findall(r"\d+", re.search(r'bounds="([^"]*)"', n).group(1))))
         print((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
         break
