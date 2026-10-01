@@ -135,11 +135,13 @@ sleep 2
 tap "حفظ مجلد المكتبة"
 tap "^مولّد المذكرات.*2 من 3"
 screen "generator"
-tap_edit 1
+tap_edit 0
 adb shell input text "Addition"
 adb shell input keyevent 111
 sleep 2
 screen "generator filled"
+adb shell input swipe 160 500 160 150 300
+sleep 2
 tap "^تحليل ومراجعة"
 sleep 8
 screen "review"
