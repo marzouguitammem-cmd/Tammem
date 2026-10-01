@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+android/build/
+android/src/teacher_core.py
+android/src/template.docx

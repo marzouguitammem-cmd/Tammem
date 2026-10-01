@@ -1,0 +1,30 @@
+[project]
+name = "teacher-file-manager"
+version = "1.0.0"
+description = "مدير ملفات المعلم - نسخة الأندرويد (تخدم بلا إنترنت)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "flet==1.0.3",
+  "python-docx>=1.1",
+  "pymupdf>=1.24",
+]
+
+[tool.flet]
+org = "com.tammem"
+product = "مدير ملفات المعلم"
+company = "Tammem"
+copyright = "Tammem"
+
+[tool.flet.app]
+path = "src"
+
+[tool.flet.android]
+# pyjnius: فتح الملفات بالتطبيقات الأخرى وطلب إذن الوصول للملفات
+dependencies = ["pyjnius"]
+# python-docx يقرا ملفات القوالب الداخلية متاعو من مسار حقيقي على القرص
+extract_packages = ["docx"]
+
+[tool.flet.android.permission]
+"android.permission.MANAGE_EXTERNAL_STORAGE" = true
+"android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.WRITE_EXTERNAL_STORAGE" = true

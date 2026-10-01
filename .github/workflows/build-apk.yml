@@ -1,0 +1,71 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/teacher-file-manager-app-wiohl6]
+    paths: [android/**, teacher_core.py, template.docx, .github/workflows/build-apk.yml]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Copy shared code into the app
+        run: cp teacher_core.py template.docx android/src/
+      - run: pip install "flet[all]==1.0.3"
+      - name: Build APK
+        working-directory: android
+        env:
+          PYTHONIOENCODING: utf-8
+        run: flet build apk --yes --no-rich-output -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TeacherFileManager-apk
+          path: android/build/apk/*.apk
+
+  # تجربة آلية: تثبيت الـ APK على محاكي أندرويد، تشغيلو، وطباعة النصوص الظاهرة على الشاشة
+  smoke-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TeacherFileManager-apk
+          path: apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            APK=$(ls apk/*.apk | head -1); echo "APK: $APK"
+            adb install -r -g "$APK"
+            PKG=$($(ls -d $ANDROID_HOME/build-tools/* | tail -1)/aapt dump badging "$APK" | sed -n "s/package: name='\([^']*\)'.*/\1/p"); echo "PKG: $PKG"
+            adb shell appops set "$PKG" MANAGE_EXTERNAL_STORAGE allow || true
+            adb shell mkdir -p "/sdcard/Documents/خدمة/الصف الأول/الرياضيات"
+            adb logcat -c
+            adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1
+            sleep 60
+            adb shell uiautomator dump /sdcard/ui.xml || true
+            adb shell cat /sdcard/ui.xml | grep -o 'content-desc="[^"]*"\|text="[^"]*"' | grep -v '=""' | head -80 || true
+            adb shell screencap -p /sdcard/screen.png && adb pull /sdcard/screen.png screen.png || true
+            adb logcat -d | grep -i -E "python|flet|traceback|error|exception" | grep -v -i "chatty" | tail -120 || true
+            adb shell pidof "$PKG" && echo "APP_RUNNING=yes" || echo "APP_RUNNING=no"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: emulator-screenshot
+          path: screen.png
+          if-no-files-found: ignore
