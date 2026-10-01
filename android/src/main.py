@@ -612,8 +612,17 @@ class App:
                 ft.Row([ft.FilledButton("تحليل ومراجعة", icon=ft.Icons.FACT_CHECK, on_click=self.analyze), self.gen_busy]),
             ],
         )
-        self.review = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True, spacing=8, visible=False,
-                                horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        # «رجوع» و«حفظ» في شريط ثابت فوق: الصفحة طويلة، والسحب فوق خانة نص كبيرة يحرّك النص موش الصفحة
+        self.review_list = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True, spacing=8,
+                                     horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        self.review = ft.Column(expand=True, spacing=6, visible=False, controls=[
+            ft.Row([
+                ft.OutlinedButton("رجوع", icon=ft.Icons.ARROW_FORWARD, on_click=self.back_to_form),
+                ft.FilledButton("حفظ", icon=ft.Icons.SAVE, on_click=self.save_generated),
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ft.Divider(height=1),
+            self.review_list,
+        ])
         self.generator_tab = ft.Container(ft.Column([self.gen_form, self.review], expand=True), padding=16, expand=True)
         self.page_counts = {}
         self.fields = {}
@@ -756,12 +765,8 @@ class App:
                 ft.Container(ft.Text("\n".join(guide_lines), selectable=True), padding=8)]),
             ft.ExpansionTile(title=ft.Text("النص الأصلي: الكتاب"), controls=[
                 ft.Container(ft.Text("\n".join(book_lines) or "—", selectable=True), padding=8)]),
-            ft.Row([
-                ft.OutlinedButton("رجوع", icon=ft.Icons.ARROW_FORWARD, on_click=self.back_to_form),
-                ft.FilledButton("حفظ", icon=ft.Icons.SAVE, on_click=self.save_generated),
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         ]
-        self.review.controls = controls
+        self.review_list.controls = controls
         self.gen_form.visible = False
         self.review.visible = True
         self.page.update()

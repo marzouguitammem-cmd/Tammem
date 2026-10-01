@@ -139,6 +139,13 @@ tap_edit 0
 adb shell input text "Addition"
 adb shell input keyevent 111
 sleep 2
+for idx in 3 5; do  # صفحات الدليل والكتاب: إلى 2
+  tap_edit $idx
+  adb shell input keyevent KEYCODE_MOVE_END KEYCODE_DEL
+  adb shell input text "2"
+  adb shell input keyevent 111
+  sleep 1
+done
 screen "generator filled"
 adb shell input swipe 160 500 160 150 300
 sleep 2
@@ -146,9 +153,6 @@ tap "^تحليل ومراجعة"
 sleep 8
 screen "review"
 shot 5-review
-for i in $(seq 1 25); do adb shell input swipe 160 500 160 80 200; done  # صفحة المراجعة طويلة (22 خانة)
-sleep 2
-screen "review bottom"
 tap "^حفظ$"
 sleep 4
 screen "after generator save"
