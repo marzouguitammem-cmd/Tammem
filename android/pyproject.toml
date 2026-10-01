@@ -28,3 +28,8 @@ extract_packages = ["docx"]
 "android.permission.MANAGE_EXTERNAL_STORAGE" = true
 "android.permission.READ_EXTERNAL_STORAGE" = true
 "android.permission.WRITE_EXTERNAL_STORAGE" = true
+
+# jni_flutter 1.0.4 (تنشرت 2026-10-01) تطلب jni ^1.1.0 وقالب Flet 1.0.3 يفرض jni 1.0.0:
+# نثبّتو النسخة اللي تخدم مع القالب.
+[tool.flet.flutter.pubspec.dependency_overrides]
+jni_flutter = "1.0.3"
