@@ -609,7 +609,6 @@ class App:
                 ft.Text("صفحات الدرس في الكتاب", weight=ft.FontWeight.BOLD),
                 ft.Row([self.book_from, self.book_to]),
                 self.gen_mode,
-                ft.Row([ft.FilledButton("تحليل ومراجعة", icon=ft.Icons.FACT_CHECK, on_click=self.analyze), self.gen_busy]),
             ],
         )
         # «رجوع» و«حفظ» في شريط ثابت فوق: الصفحة طويلة، والسحب فوق خانة نص كبيرة يحرّك النص موش الصفحة
@@ -623,7 +622,13 @@ class App:
             ft.Divider(height=1),
             self.review_list,
         ])
-        self.generator_tab = ft.Container(ft.Column([self.gen_form, self.review], expand=True), padding=16, expand=True)
+        # زر التحليل في شريط ثابت لوطة: ديما ظاهر حتى في التلفونات الصغيرة
+        self.gen_page = ft.Column(expand=True, spacing=6, controls=[
+            self.gen_form,
+            ft.Divider(height=1),
+            ft.Row([ft.FilledButton("تحليل ومراجعة", icon=ft.Icons.FACT_CHECK, on_click=self.analyze), self.gen_busy]),
+        ])
+        self.generator_tab = ft.Container(ft.Column([self.gen_page, self.review], expand=True), padding=16, expand=True)
         self.page_counts = {}
         self.fields = {}
 
@@ -767,13 +772,13 @@ class App:
                 ft.Container(ft.Text("\n".join(book_lines) or "—", selectable=True), padding=8)]),
         ]
         self.review_list.controls = controls
-        self.gen_form.visible = False
+        self.gen_page.visible = False
         self.review.visible = True
         self.page.update()
 
     def back_to_form(self, e=None):
         self.review.visible = False
-        self.gen_form.visible = True
+        self.gen_page.visible = True
         self.page.update()
 
     async def save_generated(self, e=None):

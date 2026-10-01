@@ -147,8 +147,6 @@ for idx in 3 5; do  # صفحات الدليل والكتاب: إلى 2
   sleep 1
 done
 screen "generator filled"
-for i in 1 2 3 4; do adb shell input swipe 160 520 160 120 250; done  # ننزلو لزر التحليل
-sleep 2
 tap "^تحليل ومراجعة"
 sleep 8
 screen "review"
