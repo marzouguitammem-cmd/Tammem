@@ -146,18 +146,24 @@ tap "^تحليل ومراجعة"
 sleep 8
 screen "review"
 shot 5-review
-adb shell input swipe 160 500 160 100 300
-sleep 1
-adb shell input swipe 160 500 160 100 300
-sleep 1
-adb shell input swipe 160 500 160 100 300
+for i in $(seq 1 25); do adb shell input swipe 160 500 160 80 200; done  # صفحة المراجعة طويلة (22 خانة)
 sleep 2
+screen "review bottom"
 tap "^حفظ$"
 sleep 4
 screen "after generator save"
 tap "^لا$"
 echo "===== FILES IN LIB/math ====="
 adb shell ls "$LIB/math"
+adb pull "$LIB/math/math - Addition - أسبوع 1.docx" memo.docx && python3 - <<'PY'
+import re, zipfile
+xml = zipfile.ZipFile("memo.docx").read("word/document.xml").decode("utf-8")
+text = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", xml))
+print("MEMO_CHARS", len(text))
+print("LEFTOVER_PLACEHOLDERS" if "{{" in text else "NO_LEFTOVER_PLACEHOLDERS")
+for k in ("النّشاط الأوّل", "الاستنتاج", "كتاب التلميذ"):
+    print("HAS", k, k in text)
+PY
 
 echo "===== LOGCAT (app) ====="
 adb logcat -d | grep -i -E "python|flet|traceback|exception|fatal|jnius" | grep -v -i -E "chatty|PeoplePU|gms|Conscrypt|CorpusConfig|MediaScanner" | tail -80 || true

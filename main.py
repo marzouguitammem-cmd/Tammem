@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """مدير ملفات المعلم - Teacher File Manager (PyQt6)."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -46,7 +47,8 @@ from teacher_core import (  # المنطق المشترك مع نسخة الأن
     auto_file_name,
     BOOK_FILE,
     BOOK_KEY,
-    COMMON_WORDS,
+    build_generator_values,
+    DEFAULT_KEYWORDS,
     docx,
     extract_lines,
     fill_docx,
@@ -56,14 +58,14 @@ from teacher_core import (  # المنطق المشترك مع نسخة الأن
     is_hidden,
     KEYWORDS_FILE,
     list_entries,
+    keyword_vocab,
     load_keywords,
     MemoError,
     natural_key,
     normalize,
     pdf_page_count,
     placeholder_key,
-    reflow,
-    segment_guide,
+    section_in_template,
     subfolders,
     TEMPLATE_NAME,
     template_placeholders,
@@ -434,6 +436,9 @@ class MemoGeneratorDialog(QDialog):
 
         kw_btn = QPushButton("تعديل الكلمات المفتاحية")
         kw_btn.clicked.connect(self.edit_keywords)
+        kw_reset_btn = QPushButton("الكلمات الافتراضية")
+        kw_reset_btn.setToolTip("ترجّع keywords.json متاع المادة للقيم الافتراضية (مراحل الدليل والكتاب)")
+        kw_reset_btn.clicked.connect(self.reset_keywords)
         analyze_btn = QPushButton("تحليل ومراجعة")
         analyze_btn.setDefault(True)
         analyze_btn.clicked.connect(self.analyze)
@@ -441,6 +446,7 @@ class MemoGeneratorDialog(QDialog):
         close_btn.clicked.connect(self.reject)
         buttons = QHBoxLayout()
         buttons.addWidget(kw_btn)
+        buttons.addWidget(kw_reset_btn)
         buttons.addStretch(1)
         buttons.addWidget(analyze_btn)
         buttons.addWidget(close_btn)
@@ -525,8 +531,27 @@ class MemoGeneratorDialog(QDialog):
         QMessageBox.information(
             self, APP_NAME,
             f"تم فتح {KEYWORDS_FILE} في محرر النصوص.\nعدّل الكلمات واحفظ الملف، ثم اضغط «تحليل ومراجعة» من جديد.\n"
-            "اسم كل قسم لازم يطابق الكلمة المعلّمة في النموذج، مثلا {{الأهداف}}.",
+            "كل قسم فيه الكلمات اللي تدل على عنوانو في «الدليل» وفي «الكتاب».\n"
+            "اسم القسم هو الكلمة المعلّمة في النموذج، مثلا {{الوضعية المشكل}}.",
         )
+
+    def reset_keywords(self):
+        if not self.subject:
+            QMessageBox.information(self, APP_NAME, "اختر مادة أولا.")
+            return
+        if not ask_yes_no(
+            self, "الكلمات الافتراضية",
+            f"نرجّع {KEYWORDS_FILE} متاع «{self.subject}» للقيم الافتراضية؟\nالتعديلات اللي عملتها فيه تتمسح.",
+            "نعم، رجّعها", "لا", QMessageBox.Icon.Warning,
+        ):
+            return
+        try:
+            with open(os.path.join(self.subject_dir(), KEYWORDS_FILE), "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_KEYWORDS, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, f"ما نجمتش نكتب {KEYWORDS_FILE}:\n{e}")
+            return
+        QMessageBox.information(self, APP_NAME, "تم. اضغط «تحليل ومراجعة» من جديد.")
 
     # ---------- الصفحة 2: المراجعة ----------
     def build_review_page(self):
@@ -588,7 +613,7 @@ class MemoGeneratorDialog(QDialog):
             if name == BOOK_KEY:
                 hint = "ما فما نص للكتاب. عمّرو بيدك أو ارجع وصحّح الصفحات."
             else:
-                hint = f"ما لقيتش قسم «{name}» في الدليل. عمّرو بيدك (أو عدّل الكلمات المفتاحية وعاود التحليل)."
+                hint = f"ما لقيتش «{name}» لا في الدليل لا في الكتاب. عمّرو بيدك (أو عدّل الكلمات المفتاحية وعاود التحليل)."
             warning = QLabel("⚠ " + hint)
             warning.setStyleSheet("color: #9a6700;")
             warning.setWordWrap(True)
@@ -637,9 +662,7 @@ class MemoGeneratorDialog(QDialog):
         book_range = self.read_range(self.book_from, self.book_to, "book", "الكتاب") if has_book else None
 
         self.keywords = load_keywords(folder)
-        vocab = set(COMMON_WORDS)
-        for words in self.keywords.values():
-            vocab.update(normalize(part) for w in words for part in w.split())
+        vocab = keyword_vocab(self.keywords)
         mode = self.mode_box.currentData()
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -649,17 +672,15 @@ class MemoGeneratorDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
 
-        sections, _unclassified = segment_guide(guide_lines, self.keywords)
-        values = dict(sections)
-        values[BOOK_KEY] = reflow(book_lines)
+        values, self.extra_values = build_generator_values(guide_lines, book_lines, self.keywords)
         self.guide_view.setPlainText("\n".join(guide_lines))
         self.book_view.setPlainText("\n".join(book_lines))
-        self.rebuild_fields(values, [k for k, v in sections.items() if v])
+        self.rebuild_fields(values, [k for k, v in values.items() if v])
 
-        missing = [k for k, v in sections.items() if not v]
+        missing = [k for k, v in values.items() if k != BOOK_KEY and not v]
         note = f"المادة: {self.subject} — الدرس: {self.lesson_edit.text().strip()} — أسبوع {self.week_spin.value()}."
         if missing:
-            note += f"\nأقسام ما تلقاتش في الدليل (معلّمة بالأصفر): {'، '.join(missing)}."
+            note += f"\nأقسام ما تلقاتش لا في الدليل لا في الكتاب (معلّمة بالأصفر): {'، '.join(missing)}."
         if not has_book:
             note += f"\nما فما {BOOK_FILE} في مجلد المادة، خانة الكتاب فارغة."
         self.review_info.setText(note)
@@ -681,6 +702,7 @@ class MemoGeneratorDialog(QDialog):
             "الأسبوع": str(self.week_spin.value()),
             "التاريخ": fmt_date(self.date_edit.date()),
         }
+        values.update(getattr(self, "extra_values", {}))  # {{القسم - الدليل}} و{{القسم - الكتاب}}
         for field, (edit, _warning) in self.fields.items():
             values[field] = edit.toPlainText().strip()
         try:
@@ -699,7 +721,8 @@ class MemoGeneratorDialog(QDialog):
         unknown = [orig for key, orig in present.items() if key not in known]
         if unknown:
             warnings.append("كلمات معلّمة في النموذج ما عندها خانة (بقات كيما هي): " + "، ".join("{{%s}}" % u for u in unknown))
-        unused = [f for f, v in values.items() if f in self.fields and v and placeholder_key(f) not in present]
+        unused = [f for f, v in values.items()
+                  if f in self.fields and f != BOOK_KEY and v and not section_in_template(f, present)]
         if unused:
             warnings.append("أقسام فيها نص لكن ما فماش كلمة معلّمة ليها في النموذج (ما تدخلتش للمذكرة): " + "، ".join("{{%s}}" % u for u in unused))
         if warnings:

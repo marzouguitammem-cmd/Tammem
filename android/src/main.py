@@ -710,18 +710,14 @@ class App:
         has_book = bool(self.page_counts.get("book"))
         book_range = page_range(self.book_from, self.book_to, "book", "الكتاب") if has_book else None
         keywords = core.load_keywords(folder)
-        vocab = set(core.COMMON_WORDS)
-        for words in keywords.values():
-            vocab.update(core.normalize(part) for w in words for part in w.split())
+        vocab = core.keyword_vocab(keywords)
         mode = self.gen_mode.value or "auto"
 
         guide_lines = await asyncio.to_thread(core.extract_lines, os.path.join(folder, core.GUIDE_FILE), *guide_range, mode, vocab)
         book_lines = []
         if has_book:
             book_lines = await asyncio.to_thread(core.extract_lines, os.path.join(folder, core.BOOK_FILE), *book_range, mode, vocab)
-        sections, _unclassified = core.segment_guide(guide_lines, keywords)
-        values = dict(sections)
-        values[core.BOOK_KEY] = core.reflow(book_lines)
+        values, self.extra_values = core.build_generator_values(guide_lines, book_lines, keywords)
         self.review_meta = {"subject": subject, "lesson": lesson, "week": week, "date": fmt_date(self.gen_date)}
         self.build_review(values, guide_lines, book_lines, has_book)
 
@@ -733,14 +729,14 @@ class App:
             ft.Text(f"{meta['subject']} — {meta['lesson']} — أسبوع {meta['week']}", weight=ft.FontWeight.BOLD, size=16),
         ]
         if missing:
-            controls.append(ft.Text(f"أقسام ما تلقاتش في الدليل (معلّمة بالأصفر): {'، '.join(missing)}.", color=ft.Colors.AMBER_900))
+            controls.append(ft.Text(f"أقسام ما تلقاتش لا في الدليل لا في الكتاب (معلّمة بالأصفر): {'، '.join(missing)}.", color=ft.Colors.AMBER_900))
         if not has_book:
             controls.append(ft.Text(f"ما فما {core.BOOK_FILE} في مجلد المادة، خانة الكتاب فارغة.", color=ft.Colors.AMBER_900))
         for name, text in values.items():
             if name == core.BOOK_KEY:
                 hint = "ما فما نص للكتاب. عمّرو بيدك أو ارجع وصحّح الصفحات."
             else:
-                hint = f"ما لقيتش «{name}» في الدليل. عمّرو بيدك أو عدّل الكلمات المفتاحية."
+                hint = f"ما لقيتش «{name}» لا في الدليل لا في الكتاب. عمّرو بيدك أو عدّل الكلمات المفتاحية."
             field = ft.TextField(label=name, value=text, multiline=True, min_lines=3, max_lines=14, rtl=True, helper_max_lines=3)
 
             def paint(e=None, f=field, h=hint):
@@ -786,6 +782,7 @@ class App:
         ):
             return
         values = {"المادة": meta["subject"], "الدرس": meta["lesson"], "الأسبوع": str(meta["week"]), "التاريخ": meta["date"]}
+        values.update(getattr(self, "extra_values", {}))  # {{القسم - الدليل}} و{{القسم - الكتاب}}
         for field_name, field in self.fields.items():
             values[field_name] = (field.value or "").strip()
         try:
@@ -802,7 +799,8 @@ class App:
         unknown = [orig for key, orig in present.items() if key not in known]
         if unknown:
             warnings.append("كلمات معلّمة في النموذج ما عندها خانة (بقات كيما هي): " + "، ".join("{{%s}}" % u for u in unknown))
-        unused = [f for f, v in values.items() if f in self.fields and v and core.placeholder_key(f) not in present]
+        unused = [f for f, v in values.items()
+                  if f in self.fields and f != core.BOOK_KEY and v and not core.section_in_template(f, present)]
         if unused:
             warnings.append("أقسام فيها نص لكن ما فماش كلمة معلّمة ليها في النموذج: " + "، ".join("{{%s}}" % u for u in unused))
         text = f"تم حفظ المذكرة:\n{name}"
@@ -831,6 +829,11 @@ class App:
         editor = ft.TextField(value=raw, multiline=True, min_lines=10, max_lines=20, rtl=True, text_size=14)
         error = ft.Text("", color=ft.Colors.RED_700)
 
+        def restore_defaults(e):
+            editor.value = json.dumps(core.DEFAULT_KEYWORDS, ensure_ascii=False, indent=2)
+            error.value = "القيم الافتراضية متاع الدليل والكتاب. اضغط «حفظ» باش تتسجّل."
+            self.page.update()
+
         def save(e):
             try:
                 data = json.loads(editor.value or "")
@@ -854,9 +857,11 @@ class App:
             scrollable=True,
             title=ft.Text(f"الكلمات المفتاحية: {self.gen_subject.value}"),
             content=ft.Column(tight=True, controls=[
-                ft.Text("اسم القسم ← الكلمات اللي تدل على عنوانو. اسم القسم لازم يطابق {{...}} في النموذج.", size=13),
+                ft.Text("كل قسم: الكلمات اللي تدل على عنوانو في «الدليل» وفي «الكتاب». "
+                        "اسم القسم هو الكلمة المعلّمة في النموذج، مثلا {{الوضعية المشكل}}.", size=13),
                 editor, error]),
-            actions=[ft.TextButton("إلغاء", on_click=lambda e: self.page.pop_dialog()),
+            actions=[ft.TextButton("القيم الافتراضية", on_click=restore_defaults),
+                     ft.TextButton("إلغاء", on_click=lambda e: self.page.pop_dialog()),
                      ft.FilledButton("حفظ", on_click=save)],
         ))
 
