@@ -27,8 +27,9 @@ for n in re.findall(r"<node [^>]*>", x):
     d = html.unescape(re.search(r'content-desc="([^"]*)"', n).group(1))
     t = html.unescape(re.search(r' text="([^"]*)"', n).group(1))
     pkg = re.search(r'package="([^"]*)"', n).group(1)
-    if d or t:
-        print(f"[{pkg}] {d} {t}".replace("\n", " / "))
+    cls = re.search(r'class="([^"]*)"', n).group(1)
+    if d or t or "EditText" in cls:
+        print(f"[{pkg}] ({cls.split('.')[-1]}) {d} {t}".replace("\n", " / "))
 PY
 }
 tap() {  # يضغط على أول عنصر نصّو يطابق regex
@@ -50,6 +51,23 @@ PY
   sleep 3
 }
 
+tap_edit() {  # يضغط على الخانة النصية رقم $1 (من 0)
+  adb shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1
+  adb pull /sdcard/ui.xml ui.xml >/dev/null 2>&1
+  XY=$(python3 - "$1" <<'PY'
+import re, sys
+x = open("ui.xml", encoding="utf-8").read()
+nodes = [n for n in re.findall(r"<node [^>]*>", x) if "EditText" in n]
+if len(nodes) > int(sys.argv[1]):
+    b = list(map(int, re.findall(r"\d+", re.search(r'bounds="([^"]*)"', nodes[int(sys.argv[1])]).group(1))))
+    print((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+PY
+)
+  echo "tap_edit $1 -> $XY"
+  [ -n "$XY" ] && adb shell input tap $XY
+  sleep 2
+}
+
 adb logcat -c
 adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1
 sleep 75
@@ -58,7 +76,7 @@ adb shell screencap -p /sdcard/screen.png && adb pull /sdcard/screen.png screen-
 
 tap "^الإعدادات.*3 من 3"
 screen "settings"
-tap "المجلد الرئيسي \(مجلد الخدمة\)"
+tap_edit 0
 adb shell input text "$ROOT"
 sleep 2
 adb shell input keyevent 111   # إخفاء الكلافيي
