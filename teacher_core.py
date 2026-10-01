@@ -354,22 +354,97 @@ _MIRROR = str.maketrans("()[]{}<>«»", ")(][}{><»«")
 _LTR_RUN = re.compile(r"[0-9٠-٩]+(?:[.,:/][0-9٠-٩]+)*|[A-Za-z][A-Za-z0-9]*(?:[ .,:/'’&+-]+[A-Za-z0-9]+)*")
 
 
+# ---------- خطوط AXt القديمة (Arabic XT متاع QuarkXPress) ----------
+# برشة كتب مدرسية تونسية متعملة بـ QuarkXPress وخطوط AXt: كل شكل حرف عربي مخزّن في بلاصة حرف من
+# ترميز Mac Roman (الألف بلاصة G...)، والسطر مخزّن بالترتيب المرئي (من اليسار لليمين).
+# النص المستخرج يطلع رموز لاتينية (مثلا «á«Hô©dG» = «العربية»). الجدول هذا يرجّعها عربي.
+# تبنى من دليل المعلم متاع الإيقاظ العلمي (المركز الوطني البيداغوجي) بمقارنة النص المشفّر بالنص الحقيقي.
+AXT_TABLE = {
+    "μ": "ك", "@": "",
+    "'": "لا", "A": "ء", "B": "ٓ", "C": "ٔ", "D": "ٔ", "E": "ٕ", "F": "ئ", "G": "ا", "H": "ب", "I": "ة",
+    "J": "ت", "K": "ث", "L": "ج", "M": "ح", "N": "خ", "O": "د", "P": "ذ", "Q": "ر", "R": "ز", "S": "س",
+    "T": "ش", "U": "ص", "V": "ض", "W": "ط", "X": "ظ", "Y": "ع", "Z": "غ", "^": ",", "`": "يار", "a": "ف",
+    "b": "ق", "c": "ك", "d": "ل", "e": "م", "f": "ن", "g": "ه", "h": "و", "i": "ى", "j": "ي", "o": "م",
+    "z": "»", "{": "«", "¡": "ه", "£": "ط", "¤": "لى", "¥": "ق", "§": "ط", "¨": "غ", "©": "ع", "ª": "م",
+    "«": "ي", "¬": "ه", "®": "ظ", "±": "ف", "´": "ع", "µ": "ك", "¶": "ظ", "º": "م", "»": "ي", "¿": "ن",
+    "Á": "يم", "Ã": "بم", "Ä": "ئ", "Å": "ئ", "Æ": "غ", "È": "بر", "É": "ا", "Ê": "ني", "Ë": "يم", "Ì": "ثر",
+    "Î": "تر", "Ñ": "ب", "Ò": "ير", "Ó": "لا", "Ö": "ب", "Ø": "ف", "Ù": "لمح", "Ú": "ين", "Û": "لمج",
+    "Ü": "ب", "ß": "ظ", "à": "ت", "á": "ة", "â": "ت", "ã": "ث", "ä": "ت", "å": "ث", "æ": "ن", "ç": "ث",
+    "è": "ج", "é": "ج", "ê": "ج", "ë": "ح", "ì": "ح", "í": "ح", "î": "خ", "ï": "خ", "ñ": "خ", "ò": "ذ",
+    "ó": "د", "ô": "ر", "õ": "ز", "÷": "لج", "ø": "ن", "ù": "س", "û": "ش", "ü": "ص", "ÿ": "لخ", "ı": "لمخ",
+    "Œ": "تج", "œ": "تج", "Ÿ": "لم", "ƒ": "و", "Ω": "م", "π": "ل", "–": "تح", "‘": "في", "’": "لا",
+    "‚": "نج", "“": "تم", "”": "تم", "†": "ض", "‡": "مم", "•": "ط", "…": "ي", "‰": "نم", "‹": "لي",
+    "›": "مج", "⁄": "لم", "™": "ع", "Ω": "م", "∂": "ك", "∏": "ل", "∑": "ك", "√": "ه", "∞": "ف", "∫": "ل",
+    "≈": "ى", "≠": "غ", "≤": "ق", "≥": "ق", "◊": "لح", "ﬁ": "مح", "ﬂ": "مخ", "\"": "", "<": "", "\\": "",
+    "n": "", "p": "", "q": "", "r": "", "s": "", "t": "", "u": "", "¢": "", "°": "", "·": "", "˘": "",
+}
+_AXT_LATIN_COMMON = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789éèàùâêîôûçëïüÉÈÀÙ .,:;!?()-'\"")
+_AXT_STRONG = set(AXT_TABLE) - _AXT_LATIN_COMMON  # رموز نادرة في النص الفرنسي ولا الإنقليزي
+_HAMZA_MARKS = "\u0653\u0654\u0655"
+
+
+def is_axt_text(text, font_name=""):
+    """السطر مكتوب بخط AXt؟ (اسم الخط، وإلا نسبة الرموز الخاصة بالترميز)."""
+    if "axt" in (font_name or "").lower():
+        return True
+    chars = [c for c in text if not c.isspace()]
+    if len(chars) < 3 or _ARABIC_CHAR.search(text):
+        return False
+    strong = sum(1 for c in chars if c in _AXT_STRONG)
+    return strong >= 2 and strong / len(chars) >= 0.2
+
+
+def decode_axt(visual_text):
+    """يحوّل سطر AXt (بالترتيب المرئي من اليسار لليمين) لنص عربي بالترتيب الصحيح."""
+    text = visual_text.replace("fi", "ﬁ").replace("fl", "ﬂ")
+    text = re.sub(r"(?<!\S)\\`(?!\S)", "•", text)  # «\`» وحدو = نقطة تعداد، ملصوق بكلمة = «يار»
+    out = "".join(AXT_TABLE.get(ch, ch) for ch in reversed(text))
+    out = out.translate(_MIRROR)
+    out = _LTR_RUN.sub(lambda m: m.group(0)[::-1], out)  # الأرقام تقعد من اليسار لليمين
+    # الهمزة والمدّة تتبع الألف/الواو/الياء اللي بعدها كي ما يكونش قبلها حرف يحملها
+    out = re.sub(f"(?<![اويىأإآ])([{_HAMZA_MARKS}])([اويى])", r"\2\1", out)
+    out = unicodedata.normalize("NFC", out)
+    out = re.sub(r"(^|\s)ا (ل[اأإآ])", r"\1ا\2", out)  # «ا لأفقية» = «الأفقية»
+    out = re.sub(r"(?<=[\u0621-\u064a]) (?=[ؤئ])", "", out)  # «م ؤشرات» = «مؤشرات»
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+def _spaced_ltr(row, h):
+    """حروف السطر من اليسار لليمين مع الفراغات (حرف فراغ ولا مسافة كبيرة بين حرفين)."""
+    text, prev = "", None
+    for g in sorted(row, key=lambda g: g[1] + g[3]):
+        if g[0].isspace():
+            text += "" if text.endswith(" ") else " "
+        else:
+            if prev is not None and g[1] - prev[3] > 0.25 * h and not text.endswith(" "):
+                text += " "
+            text += g[0]
+        prev = g
+    return text
+
+
 def page_lines(page, mode):
     """أسطر الصفحة بترتيب القراءة.
     نبنيو السطر حرف بحرف حسب بلاصة كل حرف في الصفحة (موش حسب ترتيب التخزين في PDF):
     هكا نتفادو الكلمات المعكوسة والمقطّعة، والأقواس والأرقام المقلوبة في النص العربي."""
     if mode == "raw":
-        return page.get_text("text", sort=True).splitlines()
-    glyphs = []  # [نص، x0، y0، x1، y1]
+        raw = page.get_text("text", sort=True).splitlines()
+        lettered = [line for line in raw if any(ch.isalpha() for ch in line)]
+        page_axt = bool(lettered) and sum(map(is_axt_text, lettered)) >= 0.5 * len(lettered)
+        return [decode_axt(line) if is_axt_text(line) or (page_axt and not _ARABIC_CHAR.search(line)
+                                                           and re.search("[A-Za-z]", line)) else line
+                for line in raw]
+    glyphs = []  # [نص، x0، y0، x1، y1، خط AXt؟]
     for block in page.get_text("rawdict")["blocks"]:
         for line in block.get("lines", []):
             for span in line["spans"]:
+                axt_font = "axt" in span.get("font", "").lower()
                 for c in span["chars"]:
                     ch, (x0, y0, x1, y1) = c["c"], c["bbox"]
-                    if unicodedata.category(ch) in ("Mn", "Me") and glyphs:
+                    if not axt_font and unicodedata.category(ch) in ("Mn", "Me") and glyphs:
                         glyphs[-1][0] += ch  # الشكل (الشدّة، الضمّة...) يتبع الحرف اللي قبلو
                     else:
-                        glyphs.append([ch, x0, y0, x1, y1])
+                        glyphs.append([ch, x0, y0, x1, y1, axt_font])
     rows = []  # [مركز y، ارتفاع، حروف]
     for g in sorted(glyphs, key=lambda g: (g[2] + g[4]) / 2):
         yc, h = (g[2] + g[4]) / 2, max(g[4] - g[2], 1)
@@ -377,6 +452,11 @@ def page_lines(page, mode):
             rows[-1][2].append(g)
         else:
             rows.append([yc, h, [g]])
+    # إذا أغلب أسطر الصفحة بخط AXt، الأسطر اللاتينية القصيرة (مثلا «IQGRh» = وزارة) زادة AXt
+    lettered = [r for r in rows if any(ch.isalpha() for g in r[2] for ch in g[0])]
+    axt_rows = sum(1 for r in lettered
+                   if any(g[5] for g in r[2]) or is_axt_text("".join(g[0] for g in r[2])))
+    page_axt = bool(lettered) and axt_rows >= 0.5 * len(lettered)
     lines = []
     for _yc, _h, row in rows:
         solid = [g for g in row if not g[0].isspace()]
@@ -384,6 +464,11 @@ def page_lines(page, mode):
             continue
         heights = sorted(g[4] - g[2] for g in solid)
         h = max(heights[len(heights) // 2], 1)
+        visual = "".join(g[0] for g in sorted(row, key=lambda g: g[1] + g[3]))
+        if (any(g[5] for g in solid) or is_axt_text(visual)
+                or (page_axt and not _ARABIC_CHAR.search(visual) and re.search("[A-Za-z]", visual))):
+            lines.append(decode_axt(_spaced_ltr(row, h)))  # خط AXt: نفكّو الترميز
+            continue
         arabic = sum(len(_ARABIC_CHAR.findall(g[0])) for g in solid)
         latin = sum(len(re.findall(r"[A-Za-z]", g[0])) for g in solid)
         rtl = arabic > latin
@@ -480,7 +565,8 @@ def extract_for_generator(pdf_path, first, last, mode, config, source):
     for m in modes:
         lines = extract_lines(pdf_path, first, last, m, vocab)
         score = count_headings(lines, config, source)
-        if best is None or score > best[2]:
+        # طريقة أخرى غير العادية تربح كان إذا لقات عناوين أكثر بوضوح (موش بفارق عنوان صدفة)
+        if best is None or (score > best[2] if best[1] != "auto" else score > best[2] * 1.5):
             best = (lines, m, score)
         if mode == "auto" and m == "auto" and score >= 3:
             break  # القراية العادية لقات عناوين: ما يلزمش نجرّبو غيرها
