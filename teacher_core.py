@@ -461,6 +461,51 @@ def extract_lines(pdf_path, first, last, mode, vocab):
     return lines
 
 
+def count_headings(lines, config, source):
+    """قدّاش من سطر عنوان (قسم أو فاصل) نلقاو في النص: مقياس لصحة القراية."""
+    index = _keyword_index(config, source)
+    return sum(1 for line in lines if match_heading(line, index, config))
+
+
+MODE_LABELS = dict((value, label) for label, value in TEXT_MODES)
+
+
+def extract_for_generator(pdf_path, first, last, mode, config, source):
+    """يستخرج نص الصفحات. في الوضع «تلقائي» يجرّب كل طرق القراية ويختار اللي تلقى بيها أكثر عناوين
+    (ملفات الكتب المدرسية ساعات النص فيها معكوس ولا مخزّن بترتيب مختلف).
+    يرجّع (الأسطر، الطريقة المستعملة، عدد العناوين)."""
+    vocab = keyword_vocab(config)
+    modes = [mode] if mode != "auto" else ["auto", "raw", "letters", "words"]
+    best = None
+    for m in modes:
+        lines = extract_lines(pdf_path, first, last, m, vocab)
+        score = count_headings(lines, config, source)
+        if best is None or score > best[2]:
+            best = (lines, m, score)
+        if mode == "auto" and m == "auto" and score >= 3:
+            break  # القراية العادية لقات عناوين: ما يلزمش نجرّبو غيرها
+    return best
+
+
+def extraction_notes(guide, book, guide_range, book_range):
+    """ملاحظات للمعلم على القراية: الطريقة المختارة، وتحذير إذا ما تلقى حتى عنوان.
+    guide/book: (الأسطر، الطريقة، عدد العناوين) أو None."""
+    notes = []
+    for label, info, pages in (("الدليل", guide, guide_range), ("الكتاب", book, book_range)):
+        if not info:
+            continue
+        _lines, mode, found = info
+        if mode != "auto":
+            notes.append(f"{label}: النص تقرا بطريقة «{MODE_LABELS.get(mode, mode)}» (اختيار تلقائي، كانت الأحسن).")
+        if found == 0:
+            notes.append(
+                f"⚠ ما لقيت حتى عنوان في {label} (الصفحات {pages[0]}-{pages[1]}). "
+                "تثبّت من أرقام الصفحات (رقم الصفحة في ملف PDF، موش المكتوب على الورقة)، "
+                f"وشوف «النص الأصلي: {label}» لوطة: إذا الحروف غريبة ولا مقطّعة، الـ PDF ما فيهوش نص عربي يتقرا."
+            )
+    return notes
+
+
 def reflow(lines):
     """يلصق الأسطر اللي كانت مقطوعة بسبب عرض الصفحة، ويخلي القوائم والعناوين كل وحدة في سطر."""
     paragraphs, last_len = [], 0

@@ -724,13 +724,16 @@ class App:
         has_book = bool(self.page_counts.get("book"))
         book_range = page_range(self.book_from, self.book_to, "book", "الكتاب") if has_book else None
         keywords = core.load_keywords(folder)
-        vocab = core.keyword_vocab(keywords)
         mode = self.gen_mode.value or "auto"
 
-        guide_lines = await asyncio.to_thread(core.extract_lines, os.path.join(folder, core.GUIDE_FILE), *guide_range, mode, vocab)
-        book_lines = []
+        guide = await asyncio.to_thread(
+            core.extract_for_generator, os.path.join(folder, core.GUIDE_FILE), *guide_range, mode, keywords, "guide")
+        book = None
         if has_book:
-            book_lines = await asyncio.to_thread(core.extract_lines, os.path.join(folder, core.BOOK_FILE), *book_range, mode, vocab)
+            book = await asyncio.to_thread(
+                core.extract_for_generator, os.path.join(folder, core.BOOK_FILE), *book_range, mode, keywords, "book")
+        guide_lines, book_lines = guide[0], (book[0] if book else [])
+        self.extract_notes = core.extraction_notes(guide, book, guide_range, book_range)
         values, self.extra_values = core.build_generator_values(guide_lines, book_lines, keywords)
         self.review_meta = {"subject": subject, "lesson": lesson, "week": week, "date": fmt_date(self.gen_date)}
         self.build_review(values, guide_lines, book_lines, has_book)
@@ -742,6 +745,9 @@ class App:
         controls = [
             ft.Text(f"{meta['subject']} — {meta['lesson']} — أسبوع {meta['week']}", weight=ft.FontWeight.BOLD, size=16),
         ]
+        for note in getattr(self, "extract_notes", []):
+            controls.append(ft.Container(ft.Text(note, color=ft.Colors.RED_900 if note.startswith("⚠") else ft.Colors.GREY_800),
+                                         bgcolor=ft.Colors.RED_50 if note.startswith("⚠") else None, padding=8, border_radius=8))
         if missing:
             controls.append(ft.Text(f"أقسام ما تلقاتش لا في الدليل لا في الكتاب (معلّمة بالأصفر): {'، '.join(missing)}.", color=ft.Colors.AMBER_900))
         if not has_book:

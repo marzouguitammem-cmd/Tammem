@@ -50,7 +50,8 @@ from teacher_core import (  # المنطق المشترك مع نسخة الأن
     build_generator_values,
     DEFAULT_KEYWORDS,
     docx,
-    extract_lines,
+    extract_for_generator,
+    extraction_notes,
     fill_docx,
     fitz,
     fmt_date,
@@ -58,7 +59,6 @@ from teacher_core import (  # المنطق المشترك مع نسخة الأن
     is_hidden,
     KEYWORDS_FILE,
     list_entries,
-    keyword_vocab,
     load_keywords,
     MemoError,
     natural_key,
@@ -662,15 +662,15 @@ class MemoGeneratorDialog(QDialog):
         book_range = self.read_range(self.book_from, self.book_to, "book", "الكتاب") if has_book else None
 
         self.keywords = load_keywords(folder)
-        vocab = keyword_vocab(self.keywords)
         mode = self.mode_box.currentData()
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            guide_lines = extract_lines(os.path.join(folder, GUIDE_FILE), *guide_range, mode, vocab)
-            book_lines = extract_lines(os.path.join(folder, BOOK_FILE), *book_range, mode, vocab) if has_book else []
+            guide = extract_for_generator(os.path.join(folder, GUIDE_FILE), *guide_range, mode, self.keywords, "guide")
+            book = extract_for_generator(os.path.join(folder, BOOK_FILE), *book_range, mode, self.keywords, "book") if has_book else None
         finally:
             QApplication.restoreOverrideCursor()
+        guide_lines, book_lines = guide[0], (book[0] if book else [])
 
         values, self.extra_values = build_generator_values(guide_lines, book_lines, self.keywords)
         self.guide_view.setPlainText("\n".join(guide_lines))
@@ -683,6 +683,8 @@ class MemoGeneratorDialog(QDialog):
             note += f"\nأقسام ما تلقاتش لا في الدليل لا في الكتاب (معلّمة بالأصفر): {'، '.join(missing)}."
         if not has_book:
             note += f"\nما فما {BOOK_FILE} في مجلد المادة، خانة الكتاب فارغة."
+        for extra in extraction_notes(guide, book, guide_range, book_range):
+            note += "\n" + extra
         self.review_info.setText(note)
         self.stack.setCurrentIndex(1)
 
