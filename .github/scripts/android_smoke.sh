@@ -51,6 +51,7 @@ x = open("ui.xml", encoding="utf-8").read()
 for n in re.findall(r"<node [^>]*>", x):
     h = re.search(r' hint="([^"]*)"', n)
     d = html.unescape(re.search(r'content-desc="([^"]*)"', n).group(1)) + " " + html.unescape(re.search(r' text="([^"]*)"', n).group(1)) + " " + (html.unescape(h.group(1)) if h else "")
+    d = " ".join(d.split(" ")).strip()
     if re.search(sys.argv[1], d, re.S):
         b = list(map(int, re.findall(r"\d+", re.search(r'bounds="([^"]*)"', n).group(1))))
         print((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
@@ -104,7 +105,8 @@ shot() { adb shell screencap -p /sdcard/screen.png && adb pull /sdcard/screen.pn
 # --- فتح ملف (txt: ما فما تطبيق في المحاكي → رسالة واضحة؛ html: يتفتح بـ HTML Viewer) ---
 tap "^lesson.txt"
 screen "after opening lesson.txt"
-tap "^موافق"
+adb shell input keyevent 4
+sleep 2
 tap "^page.html"
 sleep 3
 screen "after opening page.html (external viewer expected)"
