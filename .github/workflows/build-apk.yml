@@ -18,11 +18,46 @@ jobs:
       - name: Copy shared code into the app
         run: cp teacher_core.py template.docx android/src/
       - run: pip install "flet[all]==1.0.3"
+      # مفتاح توقيع ثابت: بلاش بيه كل بناء يتوقّع بمفتاح جديد والأندرويد يرفض التحديث فوق النسخة القديمة.
+      # الأولوية للسر ANDROID_KEYSTORE_B64 (ثابت للأبد)، وإلا مفتاح يتكوّن مرة وحدة ويتخبّى في الـ cache.
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.tfm-signing
+          key: tfm-android-signing-v1
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS_SECRET: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p ~/.tfm-signing
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KS_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "KS_PASS=$KS_PASS_SECRET" >> "$GITHUB_ENV"
+            echo "Using keystore from secrets"
+          else
+            if [ ! -f ~/.tfm-signing/release.jks ]; then
+              keytool -genkeypair -v -keystore ~/.tfm-signing/release.jks -storepass tfm-signing -keypass tfm-signing \
+                -alias upload -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Teacher File Manager, O=Tammem, C=TN"
+              echo "Generated a new keystore (cached for next builds)"
+            else
+              echo "Using cached keystore"
+            fi
+            echo "KS_FILE=$HOME/.tfm-signing/release.jks" >> "$GITHUB_ENV"
+            echo "KS_PASS=tfm-signing" >> "$GITHUB_ENV"
+          fi
+          keytool -list -keystore "$(grep KS_FILE "$GITHUB_ENV" | tail -1 | cut -d= -f2)" -storepass "$(grep KS_PASS "$GITHUB_ENV" | tail -1 | cut -d= -f2)" | grep -i "fingerprint" || true
       - name: Build APK
         working-directory: android
         env:
           PYTHONIOENCODING: utf-8
-        run: flet build apk --split-per-abi --yes --no-rich-output -v
+        # رقم البناء = رقم النسخة (versionCode): يكبر مع كل بناء باش الأندرويد يقبل التحديث
+        run: >
+          flet build apk --split-per-abi --yes --no-rich-output -v
+          --build-number ${{ github.run_number }} --build-version 1.0.${{ github.run_number }}
+          --android-signing-key-store "$KS_FILE" --android-signing-key-alias upload
+          --android-signing-key-store-password "$KS_PASS" --android-signing-key-password "$KS_PASS"
       - uses: actions/upload-artifact@v4
         with:
           name: TeacherFileManager-apk
