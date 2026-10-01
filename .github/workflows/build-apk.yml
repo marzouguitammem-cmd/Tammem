@@ -55,5 +55,5 @@ jobs:
         if: always()
         with:
           name: emulator-screenshot
-          path: screen.png
+          path: screen*.png
           if-no-files-found: ignore
