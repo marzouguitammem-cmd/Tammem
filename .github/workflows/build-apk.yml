@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [claude/teacher-file-manager-app-wiohl6]
-    paths: [android/**, teacher_core.py, template.docx, .github/workflows/build-apk.yml, .github/scripts/android_smoke.sh]
+    paths: [android/**, teacher_core.py, template.docx, .github/workflows/build-apk.yml, .github/scripts/android_smoke.sh, tests/fixtures/android/**]
 
 jobs:
   build:

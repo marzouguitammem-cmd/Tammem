@@ -82,10 +82,10 @@ def open_external(path):
     uri = FileProvider.getUriForFile(context, context.getPackageName() + ".provider", File(path))
     intent = Intent(Intent.ACTION_VIEW)
     intent.setDataAndType(uri, mime_type(path))
-    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-    chooser = Intent.createChooser(intent, "فتح بواسطة")
-    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    activity.startActivity(chooser)
+    # الأندرويد يفتح التطبيق الافتراضي، أو يعرض قائمة التطبيقات إذا ما فماش افتراضي
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_ACTIVITY_NEW_TASK)
+    activity.startActivity(intent)
 
 
 def has_storage_access():
