@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """مدير ملفات المعلم - Teacher File Manager (PyQt6)."""
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 from PyQt6.QtCore import QDate, QFile, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut
@@ -30,9 +32,13 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressDialog,
+    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -41,9 +47,18 @@ from PyQt6.QtWidgets import (
 
 try:  # مكتبة تعمير القوالب (python-docx)
     import docx
+    from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
 except ImportError:  # pragma: no cover
     docx = None
+
+try:  # استخراج نص PDF (مولّد المذكرات)
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover
+    try:
+        import fitz
+    except ImportError:
+        fitz = None
 
 APP_NAME = "مدير ملفات المعلم"
 TEMPLATE_NAME = "template.docx"
@@ -182,8 +197,22 @@ def fill_paragraph(p_el, mapping):
             first = False
     for node, new, old in zip(nodes, texts, originals):
         if new != old:
-            node.text = new
-            node.set(XML_SPACE, "preserve")
+            set_node_text(node, new)
+
+
+def set_node_text(node, text):
+    """يكتب النص في w:t، وكل سطر جديد (\\n) يتحوّل لفاصل سطر w:br داخل نفس الـ run."""
+    first, *rest = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    node.text = first
+    node.set(XML_SPACE, "preserve")
+    prev = node
+    for part in rest:
+        br, t = OxmlElement("w:br"), OxmlElement("w:t")
+        t.text = part
+        t.set(XML_SPACE, "preserve")
+        prev.addnext(br)
+        br.addnext(t)
+        prev = t
 
 
 def fill_docx(src, dst, values):
@@ -192,18 +221,8 @@ def fill_docx(src, dst, values):
         raise RuntimeError("مكتبة python-docx غير مثبتة. نفّذ: pip install python-docx")
     mapping = {placeholder_key(k): v for k, v in values.items()}
     document = docx.Document(src)
-    roots = [document.element.body]
-    for section in document.sections:
-        for part in (
-            section.header, section.first_page_header, section.even_page_header,
-            section.footer, section.first_page_footer, section.even_page_footer,
-        ):
-            if not part.is_linked_to_previous:
-                roots.append(part._element)
-    for root in roots:
-        # iter على كل w:p يغطي الفقرات والجداول (حتى المتداخلة) وصناديق النص
-        for p_el in list(root.iter(qn("w:p"))):
-            fill_paragraph(p_el, mapping)
+    for p_el in iter_paragraph_elements(document):  # الفقرات والجداول (حتى المتداخلة) وصناديق النص والـ header والـ footer
+        fill_paragraph(p_el, mapping)
     document.save(dst)
 
 
@@ -440,6 +459,677 @@ class NewMemoDialog(QDialog):
         super().accept()
 
 
+# ---------- مولّد المذكرات (بلا إنترنت): استخراج النص من PDF وتقسيمه ----------
+GUIDE_FILE, BOOK_FILE, KEYWORDS_FILE = "guide.pdf", "book.pdf", "keywords.json"
+BOOK_KEY = "الكتاب"
+STANDARD_KEYS = {"المادة", "الدرس", "الأسبوع", "التاريخ", BOOK_KEY}
+DEFAULT_KEYWORDS = {
+    "الأهداف": ["الأهداف", "الأهداف التعلمية", "الكفاءة", "الكفاءات", "الهدف"],
+    "الوضعية الانطلاقية": ["الوضعية الانطلاقية", "الوضعية المشكلة", "وضعية الانطلاق", "التمهيد"],
+    "المراحل": ["المراحل", "مراحل الدرس", "سير الحصة", "سير الدرس", "سير الأنشطة"],
+    "التقييم": ["التقييم", "التقويم", "تقييم", "تقويم"],
+}
+# كلمات عربية شائعة تُستعمل لكشف الحروف المعكوسة داخل الكلمة
+COMMON_WORDS = {
+    normalize(w) for w in (
+        "في من على إلى الى عن أن ان التي الذي هذا هذه ذلك كل ثم أو او مع بين عند بعد قبل "
+        "ما لا هو هي هم كان يكون تم حول خلال أي إذا اذا الدرس التلميذ المتعلم النشاط نشاط"
+    ).split()
+}
+_ARABIC_CHAR = re.compile("[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+_ARABIC_LETTERS = re.compile("[ء-ْ]+")
+_CONTROL_CHARS = re.compile("[​-‏‪-‮⁦-⁩﻿]")
+_LEADING_JUNK = re.compile(r"^[\W\d_]+")
+_LIST_ITEM = re.compile(r"^(?:[-•·*–—▪●◦]|\d+\s*[-.)]|[ء-ي]\s*[-.)]|\(\s*\w{1,3}\s*\))\s*")
+TEXT_MODES = [
+    ("تلقائي", "auto"),
+    ("ترتيب PDF الأصلي (بدون إعادة ترتيب)", "raw"),
+    ("عكس حروف الكلمات", "letters"),
+    ("عكس ترتيب الكلمات في السطر", "words"),
+]
+
+
+class MemoError(Exception):
+    """خطأ بمعنى واضح للمستخدم (الرسالة بالعربية)."""
+
+
+def load_keywords(subject_dir):
+    """يقرأ keywords.json للمادة، وإذا ما كانش موجود يكوّنو بالقيم الافتراضية."""
+    path = os.path.join(subject_dir, KEYWORDS_FILE)
+    if not os.path.isfile(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_KEYWORDS, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            raise MemoError(f"ما نجمتش نكوّن ملف {KEYWORDS_FILE} في مجلد المادة:\n{e}")
+        return {k: list(v) for k, v in DEFAULT_KEYWORDS.items()}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise MemoError(f"ملف {KEYWORDS_FILE} فيه غلطة في الكتابة (سطر {e.lineno}، عمود {e.colno}): {e.msg}\nصلّحو وعاود حاول.")
+    except OSError as e:
+        raise MemoError(f"ما نجمتش نقرا {KEYWORDS_FILE}:\n{e}")
+    if not isinstance(data, dict) or not data:
+        raise MemoError(f"ملف {KEYWORDS_FILE} لازم يكون قاموس: اسم القسم ← قائمة كلمات مفتاحية.")
+    result = {}
+    for section, words in data.items():
+        if isinstance(words, str):
+            words = [words]
+        if not isinstance(words, list) or not all(isinstance(w, str) for w in words):
+            raise MemoError(f"في {KEYWORDS_FILE}: قيمة القسم «{section}» لازم تكون قائمة نصوص.")
+        if section in STANDARD_KEYS:
+            raise MemoError(f"في {KEYWORDS_FILE}: الاسم «{section}» محجوز، بدّلو (المحجوزة: {'، '.join(sorted(STANDARD_KEYS))}).")
+        result[section] = [w for w in words if w.strip()]
+    return result
+
+
+def open_pdf(path):
+    if fitz is None:
+        raise MemoError("مكتبة PyMuPDF غير مثبتة. نفّذ: pip install PyMuPDF")
+    if not os.path.isfile(path):
+        raise MemoError(f"الملف غير موجود: {os.path.basename(path)}")
+    try:
+        doc = fitz.open(path)
+    except Exception as e:  # noqa: BLE001
+        raise MemoError(f"ما نجمتش نفتح الملف {os.path.basename(path)} (ربما تالف):\n{e}")
+    if doc.needs_pass:
+        doc.close()
+        raise MemoError(f"الملف {os.path.basename(path)} محمي بكلمة سر. شيل الحماية وعاود حاول.")
+    return doc
+
+
+def pdf_page_count(path):
+    doc = open_pdf(path)
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+def _has_arabic(text):
+    return bool(_ARABIC_CHAR.search(text))
+
+
+def page_lines(page, mode):
+    """أسطر الصفحة بترتيب القراءة. نعتمد على مواقع الكلمات في الصفحة (وليس ترتيب التخزين في PDF)
+    فنتفادو الكلمات المعكوسة الترتيب، ونلصقو الكلمات المقطّعة (حروف منفصلة عن بعضها)."""
+    if mode == "raw":
+        return page.get_text("text", sort=True).splitlines()
+    words = [w for w in page.get_text("words") if w[4].strip()]
+    rows = []  # كل سطر: [مركز y، ارتفاع، كلمات]
+    for w in sorted(words, key=lambda w: (w[1] + w[3]) / 2):
+        yc, h = (w[1] + w[3]) / 2, max(w[3] - w[1], 1)
+        if rows and abs(yc - rows[-1][0]) <= 0.5 * max(h, rows[-1][1]):
+            rows[-1][2].append(w)
+        else:
+            rows.append([yc, h, [w]])
+    lines = []
+    for _yc, h, row in rows:
+        arabic = sum(len(_ARABIC_CHAR.findall(w[4])) for w in row)
+        latin = sum(len(re.findall(r"[A-Za-z]", w[4])) for w in row)
+        if arabic > latin:
+            tokens = _rtl_tokens(sorted(row, key=lambda w: -w[2]), h)
+        else:
+            tokens = [w[4] for w in sorted(row, key=lambda w: w[0])]
+        lines.append(" ".join(tokens))
+    return lines
+
+
+def _rtl_tokens(row, height):
+    """row مرتبة من اليمين لليسار. نلصقو الأجزاء المتلاصقة، ونرجّعو عبارات اللاتينية لاتجاهها."""
+    tokens, prev = [], None
+    for w in row:
+        text = unicodedata.normalize("NFKC", w[4])
+        if prev is not None and prev[0] - w[2] < 0.1 * height and _has_arabic(text) and _has_arabic(tokens[-1]):
+            tokens[-1] += text
+        else:
+            tokens.append(text)
+        prev = w[0:1]
+    # علامة ترقيم في أول كلمة عربية (مثل «:الأهداف») مكانها الصحيح في آخرها
+    tokens = [re.sub(r"^([:：،؛.!؟]+)(.*[\u0621-\u064a])$", r"\2\1", t) if _has_arabic(t) else t for t in tokens]
+    # عبارة لاتينية متتالية (كلمات فيها حروف A-Z) تتكتب من اليسار لليمين
+    out, i = [], 0
+    while i < len(tokens):
+        if re.search(r"[A-Za-z]", tokens[i]):
+            j = i
+            while j < len(tokens) and re.search(r"[A-Za-z]", tokens[j]):
+                j += 1
+            out.extend(reversed(tokens[i:j]))
+            i = j
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
+def _word_key(token):
+    return normalize("".join(_ARABIC_LETTERS.findall(token)))
+
+
+def looks_letter_reversed(lines, vocab):
+    forward = backward = 0
+    for line in lines:
+        for token in re.findall(r"[ء-ْ]+", line):
+            key = normalize(token)
+            if key in vocab:
+                forward += 3
+            if key[::-1] in vocab:
+                backward += 3
+            if len(key) > 3 and key.startswith("ال"):
+                forward += 1
+            if len(key) > 3 and key.endswith("لا"):
+                backward += 1
+    return backward > forward * 1.5 and backward >= 3
+
+
+def repair_lines(lines, mode, vocab):
+    lines = [_CONTROL_CHARS.sub("", unicodedata.normalize("NFKC", line)).strip() for line in lines]
+    lines = [line for line in lines if line]
+    if mode == "letters" or (mode == "auto" and looks_letter_reversed(lines, vocab)):
+        lines = [_ARABIC_LETTERS.sub(lambda m: m.group(0)[::-1], line) for line in lines]
+    if mode == "words":
+        lines = [" ".join(reversed(line.split())) for line in lines]
+    return lines
+
+
+def extract_lines(pdf_path, first, last, mode, vocab):
+    """أسطر النص للصفحات first..last (ترقيم من 1)."""
+    doc = open_pdf(pdf_path)
+    try:
+        if not 1 <= first <= last <= doc.page_count:
+            raise MemoError(f"مجال الصفحات غير صحيح: {first}-{last} (الملف {os.path.basename(pdf_path)} فيه {doc.page_count} صفحة).")
+        raw = []
+        for number in range(first - 1, last):
+            raw.extend(page_lines(doc[number], mode))
+    finally:
+        doc.close()
+    lines = repair_lines(raw, mode, vocab)
+    if not lines:
+        raise MemoError(
+            f"ما لقيتش نص في الصفحات {first}-{last} من {os.path.basename(pdf_path)}.\n"
+            "ربما الصفحات صور ممسوحة ضوئيا (Scan). التطبيق يقرا النص الحقيقي برك، وما يعملش OCR."
+        )
+    return lines
+
+
+def reflow(lines):
+    """يلصق الأسطر اللي كانت مقطوعة بسبب عرض الصفحة، ويخلي القوائم والعناوين كل وحدة في سطر."""
+    paragraphs, last_len = [], 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        joinable = (
+            paragraphs and last_len >= 45 and not _LIST_ITEM.match(line)
+            and not re.search(r"[.:؟?!؛]$", paragraphs[-1])
+        )
+        if joinable:
+            paragraphs[-1] += " " + line
+        else:
+            paragraphs.append(line)
+        last_len = len(line)
+    return "\n".join(paragraphs)
+
+
+def _normalized_with_map(text):
+    chars, index = [], []
+    for i, ch in enumerate(text):
+        for nc in normalize(ch):
+            chars.append(nc)
+            index.append(i)
+    return "".join(chars), index
+
+
+def match_heading(line, keyword_index):
+    """إذا السطر عنوان قسم يرجّع (القسم، بقية النص بعد العنوان) وإلا None."""
+    stripped = _LEADING_JUNK.sub("", line.strip())
+    norm, index = _normalized_with_map(stripped)
+    for keyword, section in keyword_index:
+        if not norm.startswith(keyword):
+            continue
+        if len(norm) > len(keyword) and "ء" <= norm[len(keyword)] <= "ي":
+            continue  # الكلمة المفتاحية لازم تكون كلمة كاملة
+        rest = stripped[index[len(keyword) - 1] + 1:]
+        colon = re.match(r"^[^:：]{0,40}[:：]\s*(.*)$", rest)
+        if colon:
+            return section, colon.group(1).strip()
+        if len(rest.strip()) <= 30 and not re.search(r"[.؟?!]", rest):
+            return section, ""
+    return None
+
+
+def segment_guide(lines, keywords):
+    """يقسّم أسطر الدليل حسب العناوين. يرجّع (قاموس القسم ← نص، أسطر ما قبل أول عنوان)."""
+    keyword_index = sorted(
+        ((normalize(kw.strip()), section) for section, kws in keywords.items() for kw in kws if kw.strip()),
+        key=lambda item: -len(item[0]),
+    )
+    found = {section: [] for section in keywords}
+    current, unclassified = None, []
+    for line in lines:
+        heading = match_heading(line, keyword_index)
+        if heading:
+            current = heading[0]
+            if heading[1]:
+                found[current].append(heading[1])
+        elif current is None:
+            unclassified.append(line)
+        else:
+            found[current].append(line)
+    return {section: reflow(body) for section, body in found.items()}, unclassified
+
+
+def iter_paragraph_elements(document):
+    """كل فقرات المستند: الجسم (وفيه الجداول وصناديق النص) والـ header والـ footer."""
+    roots = [document.element.body]
+    for section in document.sections:
+        for part in (
+            section.header, section.first_page_header, section.even_page_header,
+            section.footer, section.first_page_footer, section.even_page_footer,
+        ):
+            if not part.is_linked_to_previous:
+                roots.append(part._element)
+    for root in roots:
+        yield from list(root.iter(qn("w:p")))
+
+
+def template_placeholders(template_path):
+    """أسماء الكلمات المعلّمة الموجودة في النموذج (مطبّعة)."""
+    if docx is None:
+        raise MemoError("مكتبة python-docx غير مثبتة. نفّذ: pip install python-docx")
+    try:
+        document = docx.Document(template_path)
+    except Exception as e:  # noqa: BLE001
+        raise MemoError(f"ما نجمتش نفتح النموذج {os.path.basename(template_path)} (ربما تالف):\n{e}")
+    found = {}
+    for p_el in iter_paragraph_elements(document):
+        text = "".join(t.text or "" for t in p_el.iter(qn("w:t")))
+        for m in PLACEHOLDER_RE.finditer(text):
+            found[placeholder_key(m.group(1))] = m.group(1).strip()
+    return found
+
+
+def fmt_date(d):
+    return f"{d.day():02d}/{d.month():02d}/{d.year()}"
+
+
+def ask_yes_no(parent, title, text, yes_text, no_text, icon=QMessageBox.Icon.Question):
+    box = QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    yes = box.addButton(yes_text, QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(no_text, QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(yes)
+    box.exec()
+    return box.clickedButton() is yes
+
+
+def rtl_text_edit(read_only=False):
+    edit = QPlainTextEdit()
+    edit.setReadOnly(read_only)
+    edit.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    option = edit.document().defaultTextOption()
+    option.setTextDirection(Qt.LayoutDirection.RightToLeft)
+    edit.document().setDefaultTextOption(option)
+    return edit
+
+
+class MemoGeneratorDialog(QDialog):
+    """مولّد المذكرات (بلا إنترنت): يستخرج نص الدليل والكتاب ويعمّر نموذج Word."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.library = ""
+        self.subject = ""
+        self.keywords = {}
+        self.page_counts = {}
+        self.fields = {}  # اسم الخانة -> (QPlainTextEdit, QLabel تحذير)
+        self.created_path = None
+        self.setWindowTitle("مولّد المذكرات (بلا إنترنت)")
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.resize(1150, 720)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.build_setup_page())
+        self.stack.addWidget(self.build_review_page())
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.stack)
+
+        saved = settings.value("library_folder", "", type=str)
+        if saved and os.path.isdir(saved):
+            self.set_library(saved, remember=False)
+
+    # ---------- الصفحة 1: الإعدادات ----------
+    def build_setup_page(self):
+        page = QWidget()
+        self.lib_btn = QPushButton("اختيار مجلد المكتبة")
+        self.lib_btn.clicked.connect(self.choose_library)
+        self.lib_label = QLabel("لم يتم اختيار مجلد المكتبة")
+        self.lib_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        self.subject_list = QListWidget()
+        self.subject_list.currentItemChanged.connect(self.on_subject_changed)
+
+        self.lesson_edit = QLineEdit()
+        self.lesson_edit.setPlaceholderText("مثال: الجمع والطرح")
+        self.week_spin = QSpinBox()
+        self.week_spin.setRange(1, 60)
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("dd/MM/yyyy")
+        self.guide_from, self.guide_to = QSpinBox(), QSpinBox()
+        self.book_from, self.book_to = QSpinBox(), QSpinBox()
+        for spin in (self.guide_from, self.guide_to, self.book_from, self.book_to):
+            spin.setRange(1, 1)
+        self.guide_from.valueChanged.connect(lambda v: self.guide_to.setValue(max(v, self.guide_to.value())))
+        self.book_from.valueChanged.connect(lambda v: self.book_to.setValue(max(v, self.book_to.value())))
+        self.mode_box = QComboBox()
+        for label, value in TEXT_MODES:
+            self.mode_box.addItem(label, value)
+        self.info_label = QLabel("")
+        self.info_label.setWordWrap(True)
+
+        def pair(a, b):
+            row = QHBoxLayout()
+            row.addWidget(QLabel("من"))
+            row.addWidget(a)
+            row.addWidget(QLabel("إلى"))
+            row.addWidget(b)
+            row.addStretch(1)
+            return row
+
+        form = QFormLayout()
+        form.addRow("عنوان الدرس:", self.lesson_edit)
+        form.addRow("رقم الأسبوع:", self.week_spin)
+        form.addRow("التاريخ:", self.date_edit)
+        form.addRow("صفحات الدرس في الدليل:", pair(self.guide_from, self.guide_to))
+        form.addRow("صفحات الدرس في الكتاب:", pair(self.book_from, self.book_to))
+        form.addRow("معالجة اتجاه النص:", self.mode_box)
+
+        kw_btn = QPushButton("تعديل الكلمات المفتاحية")
+        kw_btn.clicked.connect(self.edit_keywords)
+        analyze_btn = QPushButton("تحليل ومراجعة")
+        analyze_btn.setDefault(True)
+        analyze_btn.clicked.connect(self.analyze)
+        close_btn = QPushButton("إغلاق")
+        close_btn.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addWidget(kw_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(analyze_btn)
+        buttons.addWidget(close_btn)
+
+        left = QVBoxLayout()
+        left.addLayout(form)
+        left.addWidget(self.info_label)
+        left.addStretch(1)
+        subjects = QVBoxLayout()
+        subjects.addWidget(QLabel("المواد:"))
+        subjects.addWidget(self.subject_list, 1)
+        body = QHBoxLayout()
+        body.addLayout(subjects, 1)
+        body.addLayout(left, 2)
+
+        top = QHBoxLayout()
+        top.addWidget(self.lib_btn)
+        top.addWidget(self.lib_label, 1)
+        root = QVBoxLayout(page)
+        root.addLayout(top)
+        root.addLayout(body, 1)
+        root.addLayout(buttons)
+        return page
+
+    def choose_library(self):
+        folder = QFileDialog.getExistingDirectory(self, "اختيار مجلد المكتبة", self.library or os.path.expanduser("~"))
+        if folder:
+            self.set_library(folder)
+
+    def set_library(self, folder, remember=True):
+        self.library = os.path.normpath(folder)
+        if remember:
+            self.settings.setValue("library_folder", self.library)
+        self.lib_label.setText(f"المكتبة: {self.library}")
+        self.subject_list.clear()
+        for name in subfolders(self.library):
+            path = os.path.join(self.library, name)
+            missing = [f for f in (GUIDE_FILE, BOOK_FILE, TEMPLATE_NAME) if not os.path.isfile(os.path.join(path, f))]
+            item = QListWidgetItem(name + (f"   (ناقص: {'، '.join(missing)})" if missing else ""))
+            item.setData(PATH_ROLE, name)
+            self.subject_list.addItem(item)
+        if self.subject_list.count() == 0:
+            self.info_label.setText("ما لقيت حتى مجلد مادة داخل المكتبة. كل مادة لازم تكون مجلد فيه guide.pdf وbook.pdf وtemplate.docx.")
+        else:
+            self.info_label.setText("")
+
+    def subject_dir(self):
+        return os.path.join(self.library, self.subject)
+
+    def on_subject_changed(self, item, _previous=None):
+        self.subject = item.data(PATH_ROLE) if item else ""
+        self.page_counts = {}
+        notes = []
+        for key, filename, spins in (
+            ("guide", GUIDE_FILE, (self.guide_from, self.guide_to)),
+            ("book", BOOK_FILE, (self.book_from, self.book_to)),
+        ):
+            path = os.path.join(self.subject_dir(), filename) if self.subject else ""
+            try:
+                count = pdf_page_count(path) if path else 0
+            except MemoError as e:
+                count = 0
+                notes.append(str(e))
+            self.page_counts[key] = count
+            for spin in spins:
+                spin.setEnabled(count > 0)
+                spin.setRange(1, max(count, 1))
+            if count:
+                notes.append(f"{filename}: {count} صفحة")
+        self.info_label.setText("\n".join(notes))
+
+    def edit_keywords(self):
+        if not self.subject:
+            QMessageBox.information(self, APP_NAME, "اختر مادة أولا.")
+            return
+        try:
+            load_keywords(self.subject_dir())  # يكوّن الملف بالقيم الافتراضية إذا ما كانش موجود
+            open_path(os.path.join(self.subject_dir(), KEYWORDS_FILE))
+        except (MemoError, OSError) as e:
+            QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        QMessageBox.information(
+            self, APP_NAME,
+            f"تم فتح {KEYWORDS_FILE} في محرر النصوص.\nعدّل الكلمات واحفظ الملف، ثم اضغط «تحليل ومراجعة» من جديد.\n"
+            "اسم كل قسم لازم يطابق الكلمة المعلّمة في النموذج، مثلا {{الأهداف}}.",
+        )
+
+    # ---------- الصفحة 2: المراجعة ----------
+    def build_review_page(self):
+        page = QWidget()
+        self.review_info = QLabel("")
+        self.review_info.setWordWrap(True)
+        self.fields_layout = QVBoxLayout()
+        self.fields_layout.addStretch(1)
+        holder = QWidget()
+        holder.setLayout(self.fields_layout)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(holder)
+
+        self.guide_view = rtl_text_edit(read_only=True)
+        self.book_view = rtl_text_edit(read_only=True)
+        tabs = QTabWidget()
+        tabs.addTab(self.guide_view, "النص الأصلي: الدليل")
+        tabs.addTab(self.book_view, "النص الأصلي: الكتاب")
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        splitter.addWidget(scroll)  # في RTL أول عنصر يكون على اليمين
+        splitter.addWidget(tabs)
+        splitter.setSizes([600, 500])
+
+        back_btn = QPushButton("رجوع")
+        back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        save_btn = QPushButton("حفظ")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.save)
+        buttons = QHBoxLayout()
+        buttons.addWidget(back_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(save_btn)
+
+        root = QVBoxLayout(page)
+        root.addWidget(self.review_info)
+        root.addWidget(splitter, 1)
+        root.addLayout(buttons)
+        return page
+
+    def set_field_state(self, edit, warning):
+        empty = not edit.toPlainText().strip()
+        warning.setVisible(empty)
+        edit.setStyleSheet("QPlainTextEdit { background: #fff1c2; }" if empty else "")
+
+    def rebuild_fields(self, values, found_keys):
+        while self.fields_layout.count() > 1:
+            item = self.fields_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.fields = {}
+        for name, text in values.items():
+            label = QLabel(f"<b>{name}</b>")
+            edit = rtl_text_edit()
+            edit.setMinimumHeight(110)
+            edit.setPlainText(text)
+            if name == BOOK_KEY:
+                hint = "ما فما نص للكتاب. عمّرو بيدك أو ارجع وصحّح الصفحات."
+            else:
+                hint = f"ما لقيتش قسم «{name}» في الدليل. عمّرو بيدك (أو عدّل الكلمات المفتاحية وعاود التحليل)."
+            warning = QLabel("⚠ " + hint)
+            warning.setStyleSheet("color: #9a6700;")
+            warning.setWordWrap(True)
+            edit.textChanged.connect(lambda e=edit, w=warning: self.set_field_state(e, w))
+            self.set_field_state(edit, warning)
+            index = self.fields_layout.count() - 1
+            for widget in (label, edit, warning):
+                self.fields_layout.insertWidget(index, widget)
+                index += 1
+            self.fields[name] = (edit, warning)
+
+    # ---------- التحليل ----------
+    def read_range(self, first, last, key, label):
+        a, b = first.value(), last.value()
+        if a > b:
+            raise MemoError(f"صفحات {label}: رقم البداية ({a}) أكبر من رقم النهاية ({b}).")
+        if b > self.page_counts.get(key, 0):
+            raise MemoError(f"صفحات {label}: الملف فيه {self.page_counts.get(key, 0)} صفحة برك.")
+        return a, b
+
+    def analyze(self):
+        try:
+            self.run_analysis()
+        except MemoError as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, APP_NAME, str(e))
+
+    def run_analysis(self):
+        if not self.library:
+            raise MemoError("اختر مجلد المكتبة أولا.")
+        if not self.subject:
+            raise MemoError("اختر المادة من القائمة.")
+        if not self.lesson_edit.text().strip():
+            raise MemoError("اكتب عنوان الدرس.")
+        error = validate_name(auto_file_name(self.subject, self.lesson_edit.text(), self.week_spin.value()))
+        if error:
+            raise MemoError(f"اسم المذكرة غير صالح: {error}")
+        folder = self.subject_dir()
+        for filename in (GUIDE_FILE, TEMPLATE_NAME):
+            if not os.path.isfile(os.path.join(folder, filename)):
+                raise MemoError(f"ما لقيتش {filename} في مجلد المادة «{self.subject}».")
+        if not self.page_counts.get("guide"):
+            raise MemoError(f"ما نجمتش نقرا {GUIDE_FILE}. تأكد أنو سليم وفيه صفحات.")
+        guide_range = self.read_range(self.guide_from, self.guide_to, "guide", "الدليل")
+        has_book = bool(self.page_counts.get("book"))
+        book_range = self.read_range(self.book_from, self.book_to, "book", "الكتاب") if has_book else None
+
+        self.keywords = load_keywords(folder)
+        vocab = set(COMMON_WORDS)
+        for words in self.keywords.values():
+            vocab.update(normalize(part) for w in words for part in w.split())
+        mode = self.mode_box.currentData()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            guide_lines = extract_lines(os.path.join(folder, GUIDE_FILE), *guide_range, mode, vocab)
+            book_lines = extract_lines(os.path.join(folder, BOOK_FILE), *book_range, mode, vocab) if has_book else []
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        sections, _unclassified = segment_guide(guide_lines, self.keywords)
+        values = dict(sections)
+        values[BOOK_KEY] = reflow(book_lines)
+        self.guide_view.setPlainText("\n".join(guide_lines))
+        self.book_view.setPlainText("\n".join(book_lines))
+        self.rebuild_fields(values, [k for k, v in sections.items() if v])
+
+        missing = [k for k, v in sections.items() if not v]
+        note = f"المادة: {self.subject} — الدرس: {self.lesson_edit.text().strip()} — أسبوع {self.week_spin.value()}."
+        if missing:
+            note += f"\nأقسام ما تلقاتش في الدليل (معلّمة بالأصفر): {'، '.join(missing)}."
+        if not has_book:
+            note += f"\nما فما {BOOK_FILE} في مجلد المادة، خانة الكتاب فارغة."
+        self.review_info.setText(note)
+        self.stack.setCurrentIndex(1)
+
+    # ---------- الحفظ ----------
+    def save(self):
+        folder = self.subject_dir()
+        template = os.path.join(folder, TEMPLATE_NAME)
+        name = auto_file_name(self.subject, self.lesson_edit.text(), self.week_spin.value()) + ".docx"
+        target = os.path.join(folder, name)
+        if os.path.exists(target) and not ask_yes_no(
+            self, "الملف موجود", f"يوجد ملف بنفس الاسم:\n{name}\nتحب تستبدلو؟", "نعم، استبدل", "لا", QMessageBox.Icon.Warning
+        ):
+            return
+        values = {
+            "المادة": self.subject,
+            "الدرس": self.lesson_edit.text().strip(),
+            "الأسبوع": str(self.week_spin.value()),
+            "التاريخ": fmt_date(self.date_edit.date()),
+        }
+        for field, (edit, _warning) in self.fields.items():
+            values[field] = edit.toPlainText().strip()
+        try:
+            present = template_placeholders(template)
+            fill_docx(template, target, values)
+        except MemoError as e:
+            QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        except Exception as e:  # noqa: BLE001 - نموذج تالف، ملف مفتوح في Word...
+            QMessageBox.critical(self, APP_NAME, f"ما نجمتش نحفظ المذكرة (ربما الملف مفتوح في Word):\n{e}")
+            return
+        self.created_path = target
+
+        known = {placeholder_key(k) for k in values}
+        warnings = []
+        unknown = [orig for key, orig in present.items() if key not in known]
+        if unknown:
+            warnings.append("كلمات معلّمة في النموذج ما عندها خانة (بقات كيما هي): " + "، ".join("{{%s}}" % u for u in unknown))
+        unused = [f for f, v in values.items() if f in self.fields and v and placeholder_key(f) not in present]
+        if unused:
+            warnings.append("أقسام فيها نص لكن ما فماش كلمة معلّمة ليها في النموذج (ما تدخلتش للمذكرة): " + "، ".join("{{%s}}" % u for u in unused))
+        if warnings:
+            QMessageBox.warning(self, APP_NAME, "تم حفظ المذكرة، لكن:\n\n" + "\n\n".join(warnings))
+        if ask_yes_no(self, "تم الحفظ", f"تم حفظ المذكرة:\n{name}\nتحب تفتحها توا؟", "نعم، افتحها", "لا"):
+            try:
+                open_path(target)
+            except OSError as e:
+                QMessageBox.warning(self, APP_NAME, f"ما نجمتش نفتح الملف:\n{e}")
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -467,6 +1157,8 @@ class MainWindow(QMainWindow):
         self.choose_btn.clicked.connect(self.choose_root)
         self.new_btn = QPushButton("مذكرة جديدة")
         self.new_btn.clicked.connect(self.new_memo)
+        self.generator_btn = QPushButton("مولّد المذكرات")
+        self.generator_btn.clicked.connect(self.open_generator)
         self.refresh_btn = QPushButton("تحديث")
         self.refresh_btn.clicked.connect(self.refresh_all)
 
@@ -482,6 +1174,7 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(self.choose_btn)
         top.addWidget(self.new_btn)
+        top.addWidget(self.generator_btn)
         top.addWidget(self.search_edit, 1)
         top.addWidget(self.refresh_btn)
 
@@ -904,16 +1597,14 @@ class MainWindow(QMainWindow):
             self.open_item(dlg.target)
 
     def ask(self, title, text, yes_text, no_text):
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle(title)
-        box.setText(text)
-        box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        yes = box.addButton(yes_text, QMessageBox.ButtonRole.AcceptRole)
-        box.addButton(no_text, QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(yes)
-        box.exec()
-        return box.clickedButton() is yes
+        return ask_yes_no(self, title, text, yes_text, no_text)
+
+    def open_generator(self):
+        if fitz is None or docx is None:
+            QMessageBox.warning(self, APP_NAME, "المكتبات ناقصة. نفّذ: pip install -r requirements.txt")
+            return
+        MemoGeneratorDialog(self.settings, self).exec()
+        self.refresh_all()
 
 
 def main():
