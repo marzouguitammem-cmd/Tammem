@@ -709,7 +709,7 @@ class MemoGeneratorDialog(QDialog):
             values[field] = edit.toPlainText().strip()
         try:
             present = template_placeholders(template)
-            fill_docx(template, target, values)
+            filled = fill_docx(template, target, values)
         except MemoError as e:
             QMessageBox.warning(self, APP_NAME, str(e))
             return
@@ -724,7 +724,7 @@ class MemoGeneratorDialog(QDialog):
         if unknown:
             warnings.append("كلمات معلّمة في النموذج ما عندها خانة (بقات كيما هي): " + "، ".join("{{%s}}" % u for u in unknown))
         unused = [f for f, v in values.items()
-                  if f in self.fields and f != BOOK_KEY and v and not section_in_template(f, present)]
+                  if f in self.fields and f != BOOK_KEY and v and not section_in_template(f, present) and f not in filled]
         if unused:
             warnings.append("أقسام فيها نص لكن ما فماش كلمة معلّمة ليها في النموذج (ما تدخلتش للمذكرة): " + "، ".join("{{%s}}" % u for u in unused))
         if warnings:

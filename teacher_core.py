@@ -2,6 +2,7 @@
 """المنطق المشترك بين نسخة ويندوز (main.py) ونسخة الأندرويد (android/src/main.py).
 ما فيه حتى استعمال لواجهة رسومية: ملفات، بحث، تعمير قوالب Word، واستخراج نص PDF."""
 
+import copy
 import json
 import os
 import re
@@ -164,9 +165,175 @@ def fill_docx(src, dst, values):
         raise RuntimeError("مكتبة python-docx غير مثبتة. نفّذ: pip install python-docx")
     mapping = {placeholder_key(k): v for k, v in values.items()}
     document = docx.Document(src)
+    present = set()
     for p_el in iter_paragraph_elements(document):  # الفقرات والجداول (حتى المتداخلة) وصناديق النص والـ header والـ footer
+        text = "".join(t.text or "" for t in p_el.iter(qn("w:t")))
+        present.update(placeholder_key(m.group(1)) for m in PLACEHOLDER_RE.finditer(text))
         fill_paragraph(p_el, mapping)
+    # الأقسام اللي ما عندهاش {{...}} في النموذج: نعمّروها حسب عناوين خانات الجداول («الهدف المميز»، «رصد التصورات»...)
+    filled = fill_by_labels(document, {k: v for k, v in values.items()
+                                       if not section_in_template(k, present)})
     document.save(dst)
+    return filled
+
+
+# عناوين الخانات في نماذج المعلمين (بلا {{...}}) ← القسم اللي يتكتب بحذاها.
+# قسم واحد ينجم يكون عندو برشا عناوين؛ وكي يلقى زوز عناوين لنفس القسم (رصد التصورات / بناء الفرضيات)
+# الأول ياخو جزء الدليل والثاني ياخو جزء كتاب التلميذ.
+TEMPLATE_LABELS = [
+    (("المادة",), ["المادة"]),
+    (("الدرس",), ["الدرس", "عنوان الدرس", "موضوع الدرس", "الموضوع"]),
+    (("الأسبوع",), ["الأسبوع"]),
+    (("التاريخ",), ["التاريخ"]),
+    (("الوحدة",), ["الوحدة"]),
+    (("الكفاية النهائية",), ["الكفاية النهائية", "نص الكفاية النهائية", "الكفاية"]),
+    (("المكون الأول", "المكون الثاني"), ["مكون الكفاية", "مكونات الكفاية", "المكون"]),
+    (("المكون الأول",), ["المكون الأول"]),
+    (("المكون الثاني",), ["المكون الثاني"]),
+    (("الهدف",), ["الهدف المميز", "الأهداف المميزة", "الهدف", "الأهداف", "الهدف المميز للحصة"]),
+    (("المحتوى",), ["المحتوى", "المحتويات"]),
+    (("المفاهيم",), ["المفاهيم"]),
+    (("المستلزمات",), ["المستلزمات", "المستلزمات البيداغوجية"]),
+    (("الحواجز",), ["الحواجز"]),
+    (("مؤشرات التجاوز",), ["مؤشرات التجاوز"]),
+    (("مؤشرات القدرة المستهدفة",), ["مؤشرات القدرة المستهدفة", "مؤشرات القدرة"]),
+    (("المكتسبات السابقة",), ["تعهد المكتسبات", "المكتسبات السابقة", "أتعهد مكتسباتي", "المكتسبات"]),
+    (("الوضعية المشكل",), ["الوضعية المشكل", "الوضعية المشكلة", "الوضعية الاستكشافية", "الوضعية الانطلاقية",
+                           "ألاحظ وأتساءل", "الانطلاق"]),
+    (("تحليل الوضعية ورصد التصورات",), ["تحليل الوضعية ورصد التصورات", "تحليل الوضعية", "رصد التصورات",
+                                        "التصورات", "بناء الفرضيات", "الفرضيات", "أفترض"]),
+    (("التحقق العلمي",), ["التحقق العلمي", "أجرب وأتثبت", "التجريب"]),
+    (("الاستنتاج",), ["الاستنتاج", "أستنتج"]),
+    (("التطبيق والتوظيف",), ["التطبيق والتوظيف", "التطبيق", "أطبق وأوظف", "التوظيف", "التعلم الآلي"]),
+    (("التوسع والامتداد",), ["التوسع والامتداد", "التعلم الإدماجي", "الإدماج"]),
+    (("التقييم",), ["التقييم", "التقويم", "أقيم تعلمي الجديد", "أقيم تعلمي"]),
+]
+# عنوان العمود اللي تتكتب فيه مراحل الحصة (كان الجدول فيه أعمدة: المراحل | نشاط المدرس | نشاط المتعلم...)
+ACTIVITY_HEADERS = ["نشاط المدرس", "نشاط المعلم", "نشاط المربي", "أنشطة المعلم", "سير الأنشطة", "سير الحصة", "الأنشطة"]
+_BOOK_SPLIT = "\n\nكتاب التلميذ:\n"  # نفس الفاصل اللي يحطو build_generator_values
+
+
+def _label_index():
+    entries = [(_compact(alias)[0], keys) for keys, aliases in TEMPLATE_LABELS for alias in aliases]
+    return sorted(entries, key=lambda e: -len(e[0]))
+
+
+def _match_label(text, index):
+    """خانة عنوان؟ يرجّع مفاتيح القسم. النص لازم يبدا بالعنوان كلمة كاملة («التحقق العلمي المنهج التجريبي...»)."""
+    compact, _ = _compact(text.strip().rstrip(":：").strip())
+    if not compact or len(compact) > 80:
+        return None
+    for key, keys in index:
+        if compact == key or (compact.startswith(key) and not "\u0621" <= compact[len(key)] <= "\u064a"):
+            return keys
+        if compact.startswith(key) and len(key) >= 6 and len(compact) - len(key) > 8:
+            return keys  # عنوان طويل متبوع بشرح («التحقق العلمي المنهج التجريبي / البحث الوثائقي»)
+    return None
+
+
+def _cell_text(tc):
+    return "".join(t.text or "" for t in tc.iter(qn("w:t"))).strip()
+
+
+def _grid_cells(tr):
+    """خانات السطر مع موضع كل وحدة في شبكة الجدول (يحسب الخانات المدموجة أفقيا)."""
+    cells, col = [], 0
+    for tc in tr.findall(qn("w:tc")):
+        span = tc.find(f"{qn('w:tcPr')}/{qn('w:gridSpan')}")
+        cells.append((col, tc))
+        col += int(span.get(qn("w:val"))) if span is not None else 1
+    return cells
+
+
+def _write_cell(tc, text):
+    """يكتب النص في الخانة (كل سطر في فقرة)، وكان الخانة فيها نص يزيدو تحتو."""
+    paragraphs = tc.findall(qn("w:p"))
+    empty = bool(paragraphs) and not _cell_text(tc)
+    if empty:  # خانة فارغة (ساعات فيها برشا فقرات فارغة بعد الدمج): نكتبو من الفقرة الأولى
+        for extra in paragraphs[1:]:
+            tc.remove(extra)
+        paragraphs = paragraphs[:1]
+    base = paragraphs[-1] if paragraphs else None
+    ppr = base.find(qn("w:pPr")) if base is not None else None
+    for i, line in enumerate(text.replace("\r\n", "\n").split("\n")):
+        if i == 0 and empty:
+            p = base
+        else:
+            p = OxmlElement("w:p")
+            if ppr is not None:
+                p.append(copy.deepcopy(ppr))
+            if paragraphs:
+                paragraphs[-1].addnext(p)
+            else:
+                tc.append(p)
+            paragraphs.append(p)
+        p_ppr = p.find(qn("w:pPr"))
+        if p_ppr is None:
+            p_ppr = OxmlElement("w:pPr")
+            p.insert(0, p_ppr)
+        if p_ppr.find(qn("w:bidi")) is None:
+            p_ppr.insert(0, OxmlElement("w:bidi"))  # فقرة عربية من اليمين لليسار
+        run = OxmlElement("w:r")
+        mark = p_ppr.find(qn("w:rPr"))  # تنسيق علامة الفقرة (الخط والحجم اللي اختارهم المعلم للخانة)
+        rpr = copy.deepcopy(mark) if mark is not None else OxmlElement("w:rPr")
+        if rpr.find(qn("w:rtl")) is None:
+            rpr.append(OxmlElement("w:rtl"))
+        run.append(rpr)
+        t = OxmlElement("w:t")
+        t.text = line
+        t.set(XML_SPACE, "preserve")
+        run.append(t)
+        p.append(run)
+
+
+def fill_by_labels(document, values):
+    """يعمّر نموذج ما فيهش {{...}}: كل خانة عنوان في جدول («الهدف المميز»، «رصد التصورات»...)
+    يتكتب القسم متاعها في عمود «نشاط المدرس» كان موجود، وإلا في الخانة اللي بحذاها.
+    يرجّع أسماء الأقسام اللي تكتبت."""
+    if not any(str(v).strip() for v in values.values()):
+        return set()
+    index = _label_index()
+    headers = [_compact(h)[0] for h in ACTIVITY_HEADERS]
+    slots = []  # (مفاتيح القسم، الخانة اللي نكتبو فيها)
+    for tbl in document.element.body.iter(qn("w:tbl")):
+        activity_col = None
+        for tr in tbl.findall(qn("w:tr")):
+            cells = _grid_cells(tr)
+            for col, tc in cells:
+                if _compact(_cell_text(tc))[0] in headers:
+                    activity_col = col
+                    break
+            else:
+                for pos, (col, tc) in enumerate(cells):
+                    keys = _match_label(_cell_text(tc), index)
+                    if not keys:
+                        continue
+                    target = None
+                    if activity_col is not None and activity_col > col:
+                        target = next((c for gc, c in cells if gc == activity_col), None)
+                    if target is None and pos + 1 < len(cells):
+                        target = cells[pos + 1][1]
+                    if target is not None and not _match_label(_cell_text(target), index):
+                        slots.append((keys, target))
+                    break  # خانة عنوان وحدة في السطر
+    norm = {placeholder_key(k): (str(v).strip() if v is not None else "") for k, v in values.items()}
+    by_section = {}
+    for keys, target in slots:
+        by_section.setdefault(keys, []).append(target)
+    filled = set()
+    for keys, targets in by_section.items():
+        parts = [norm.get(placeholder_key(k), "") for k in keys]
+        text = "\n".join(p for p in parts if p)
+        if not text:
+            continue
+        chunks = [text]
+        if len(targets) > 1 and _BOOK_SPLIT in text:  # عنوانين لنفس القسم: الدليل في الأول والكتاب في الثاني
+            chunks = [c.strip() for c in text.split(_BOOK_SPLIT, 1)]
+        for target, chunk in zip(targets, chunks):
+            if chunk:
+                _write_cell(target, chunk)
+        filled.update(k for k, p in zip(keys, parts) if p)
+    return filled
 
 
 def auto_file_name(subject, lesson, week):

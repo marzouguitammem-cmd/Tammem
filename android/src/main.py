@@ -803,7 +803,7 @@ class App:
             values[field_name] = (field.value or "").strip()
         try:
             present = await asyncio.to_thread(core.template_placeholders, template)
-            await asyncio.to_thread(core.fill_docx, template, target, values)
+            filled = await asyncio.to_thread(core.fill_docx, template, target, values)
         except core.MemoError as err:
             self.show_message("الحفظ", str(err))
             return
@@ -816,7 +816,7 @@ class App:
         if unknown:
             warnings.append("كلمات معلّمة في النموذج ما عندها خانة (بقات كيما هي): " + "، ".join("{{%s}}" % u for u in unknown))
         unused = [f for f, v in values.items()
-                  if f in self.fields and f != core.BOOK_KEY and v and not core.section_in_template(f, present)]
+                  if f in self.fields and f != core.BOOK_KEY and v and not core.section_in_template(f, present) and f not in filled]
         if unused:
             warnings.append("أقسام فيها نص لكن ما فماش كلمة معلّمة ليها في النموذج: " + "، ".join("{{%s}}" % u for u in unused))
         text = f"تم حفظ المذكرة:\n{name}"
