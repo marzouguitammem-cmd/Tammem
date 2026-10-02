@@ -817,8 +817,11 @@ class App:
             warnings.append("كلمات معلّمة في النموذج ما عندها خانة (بقات كيما هي): " + "، ".join("{{%s}}" % u for u in unknown))
         unused = [f for f, v in values.items()
                   if f in self.fields and f != core.BOOK_KEY and v and not core.section_in_template(f, present) and f not in filled]
-        if unused:
+        if unused and present:  # نموذج بلا {{...}} (يتعمّر بالعناوين): ما نكثروش عليه ملاحظات
             warnings.append("أقسام فيها نص لكن ما فماش كلمة معلّمة ليها في النموذج: " + "، ".join("{{%s}}" % u for u in unused))
+        if getattr(filled, "empty", None):
+            warnings.append("خانات في نموذجك بقات فارغة خاطر ما لقيتلهمش نص في الدليل ولا الكتاب: "
+                            + "، ".join(filled.empty) + ". ثبّت أرقام الصفحات، ولا اكتب النص في خانتو في شاشة المراجعة.")
         text = f"تم حفظ المذكرة:\n{name}"
         if warnings:
             text += "\n\nملاحظة:\n" + "\n".join(warnings)

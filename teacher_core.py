@@ -172,7 +172,7 @@ def fill_docx(src, dst, values):
         fill_paragraph(p_el, mapping)
     # الأقسام اللي ما عندهاش {{...}} في النموذج: نعمّروها حسب عناوين خانات الجداول («الهدف المميز»، «رصد التصورات»...)
     filled = fill_by_labels(document, {k: v for k, v in values.items()
-                                       if not section_in_template(k, present)})
+                                       if not section_in_template(k, present)})  # FillResult
     document.save(dst)
     return filled
 
@@ -209,6 +209,7 @@ TEMPLATE_LABELS = [
     (("التقييم",), ["التقييم", "التقويم", "أقيم تعلمي الجديد", "أقيم تعلمي"]),
 ]
 # عنوان العمود اللي تتكتب فيه مراحل الحصة (كان الجدول فيه أعمدة: المراحل | نشاط المدرس | نشاط المتعلم...)
+STAGE_HEADERS = ["المراحل", "المرحلة", "مراحل الدرس", "مراحل الحصة", "سير الدرس"]
 ACTIVITY_HEADERS = ["نشاط المدرس", "نشاط المعلم", "نشاط المربي", "أنشطة المعلم", "سير الأنشطة", "سير الحصة", "الأنشطة"]
 _BOOK_SPLIT = "\n\nكتاب التلميذ:\n"  # نفس الفاصل اللي يحطو build_generator_values
 
@@ -221,7 +222,7 @@ def _label_index():
 def _match_label(text, index):
     """خانة عنوان؟ يرجّع مفاتيح القسم. النص لازم يبدا بالعنوان كلمة كاملة («التحقق العلمي المنهج التجريبي...»)."""
     compact, _ = _compact(text.strip().rstrip(":：").strip())
-    if not compact or len(compact) > 80:
+    if not compact or len(compact) > 120:
         return None
     for key, keys in index:
         if compact == key or (compact.startswith(key) and not "\u0621" <= compact[len(key)] <= "\u064a"):
@@ -238,7 +239,7 @@ def _cell_text(tc):
 def _grid_cells(tr):
     """خانات السطر مع موضع كل وحدة في شبكة الجدول (يحسب الخانات المدموجة أفقيا)."""
     cells, col = [], 0
-    for tc in tr.findall(qn("w:tc")):
+    for tc in _own(tr, "w:tc", "w:tr"):
         span = tc.find(f"{qn('w:tcPr')}/{qn('w:gridSpan')}")
         cells.append((col, tc))
         col += int(span.get(qn("w:val"))) if span is not None else 1
@@ -286,54 +287,85 @@ def _write_cell(tc, text):
         p.append(run)
 
 
+class FillResult(set):
+    """الأقسام اللي تكتبت في النموذج، و.empty = عناوين خانات لقيناها في النموذج أما القسم متاعها ما فيهش نص."""
+    def __init__(self, filled=(), empty=()):
+        super().__init__(filled)
+        self.empty = list(empty)
+
+
+def _own(el, tag, parent_tag):
+    """العناصر tag اللي تابعين el مباشرة (حتى كان ملفوفين في w:sdt ولا w:customXml)، موش اللي في جدول داخلي."""
+    out = []
+    for child in el.iter(qn(tag)):
+        up = child.getparent()
+        while up is not None and up is not el and up.tag != qn(parent_tag):
+            up = up.getparent()
+        if up is el:
+            out.append(child)
+    return out
+
+
 def fill_by_labels(document, values):
     """يعمّر نموذج ما فيهش {{...}}: كل خانة عنوان في جدول («الهدف المميز»، «رصد التصورات»...)
     يتكتب القسم متاعها في عمود «نشاط المدرس» كان موجود، وإلا في الخانة اللي بحذاها.
-    يرجّع أسماء الأقسام اللي تكتبت."""
-    if not any(str(v).strip() for v in values.values()):
-        return set()
+    يخدم في الجداول من اليمين لليسار ومن اليسار لليمين، وجدول يكمّل في الصفحة الجاية بلا سطر عناوين ياخو
+    نفس أعمدة الجدول اللي قبلو. يرجّع FillResult."""
     index = _label_index()
-    headers = [_compact(h)[0] for h in ACTIVITY_HEADERS]
+    headers = {_compact(h)[0] for h in ACTIVITY_HEADERS}
+    stage_headers = {_compact(h)[0] for h in STAGE_HEADERS}
     slots = []  # (مفاتيح القسم، الخانة اللي نكتبو فيها)
+    layout = None  # (عدد الأعمدة، عمود المراحل، عمود نشاط المدرس) من آخر جدول فيه سطر عناوين
     for tbl in document.element.body.iter(qn("w:tbl")):
-        activity_col = None
-        for tr in tbl.findall(qn("w:tr")):
-            cells = _grid_cells(tr)
-            for col, tc in cells:
-                if _compact(_cell_text(tc))[0] in headers:
-                    activity_col = col
-                    break
-            else:
-                for pos, (col, tc) in enumerate(cells):
-                    keys = _match_label(_cell_text(tc), index)
-                    if not keys:
-                        continue
-                    target = None
-                    if activity_col is not None and activity_col > col:
-                        target = next((c for gc, c in cells if gc == activity_col), None)
-                    if target is None and pos + 1 < len(cells):
-                        target = cells[pos + 1][1]
-                    if target is not None and not _match_label(_cell_text(target), index):
-                        slots.append((keys, target))
-                    break  # خانة عنوان وحدة في السطر
+        rows = [_grid_cells(tr) for tr in _own(tbl, "w:tr", "w:tbl")]
+        width = max((c[-1][0] + 1 for c in rows if c), default=0)
+        current = layout if layout and layout[0] == width else None
+        for cells in rows:
+            texts = [_compact(_cell_text(tc))[0] for _, tc in cells]
+            activity = next((col for (col, _), t in zip(cells, texts) if t in headers), None)
+            if activity is not None:  # سطر العناوين: المراحل | نشاط المدرس | نشاط المتعلم | الوسائل
+                stage = next((col for (col, _), t in zip(cells, texts) if t in stage_headers), None)
+                current = layout = (width, stage, activity)
+                continue
+            positions = range(len(cells))
+            if current and current[1] is not None:
+                positions = [i for i, (col, _) in enumerate(cells) if col == current[1]]
+            for pos in positions:
+                keys = _match_label(_cell_text(cells[pos][1]), index)
+                if not keys:
+                    continue
+                col = cells[pos][0]
+                target = None
+                if current and current[2] != col:
+                    target = next((tc for gc, tc in cells if gc == current[2]), None)
+                if target is None:  # بلا سطر عناوين: الخانة اللي بحذا العنوان (بعدو، وإلا قبلو كان العنوان في الآخر)
+                    neighbor = pos + 1 if pos + 1 < len(cells) else pos - 1
+                    target = cells[neighbor][1] if neighbor >= 0 else None
+                if target is not None and not _match_label(_cell_text(target), index):
+                    slots.append((keys, target))
+                break  # خانة عنوان وحدة في السطر
     norm = {placeholder_key(k): (str(v).strip() if v is not None else "") for k, v in values.items()}
     by_section = {}
     for keys, target in slots:
         by_section.setdefault(keys, []).append(target)
-    filled = set()
+    filled, empty = set(), []
     for keys, targets in by_section.items():
+        if not any(placeholder_key(k) in norm for k in keys):
+            continue  # القسم تعمّر بكلمة معلّمة {{...}} ولا ما يخصّش هالمذكرة
         parts = [norm.get(placeholder_key(k), "") for k in keys]
         text = "\n".join(p for p in parts if p)
         if not text:
+            empty.append(" / ".join(keys))
             continue
-        chunks = [text]
+        chunks = [text] * len(targets)  # كل خانة تتعمّر
         if len(targets) > 1 and _BOOK_SPLIT in text:  # عنوانين لنفس القسم: الدليل في الأول والكتاب في الثاني
-            chunks = [c.strip() for c in text.split(_BOOK_SPLIT, 1)]
+            guide, book = (c.strip() for c in text.split(_BOOK_SPLIT, 1))
+            chunks = [guide, book] + [text] * (len(targets) - 2)
         for target, chunk in zip(targets, chunks):
             if chunk:
                 _write_cell(target, chunk)
         filled.update(k for k, p in zip(keys, parts) if p)
-    return filled
+    return FillResult(filled, empty)
 
 
 def auto_file_name(subject, lesson, week):
