@@ -106,6 +106,12 @@ def search_names(root, query, limit=1000):
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 _INVISIBLE = re.compile("[​-‏‪-‮⁦-⁩﻿]")
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+# حروف ما يقبلهاش ملف Word (XML): حروف تحكّم مخفية تجي ساعات من ملفات PDF
+_XML_INVALID = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]")
+
+
+def xml_safe(text):
+    return _XML_INVALID.sub("", str(text)) if text is not None else ""
 
 
 def placeholder_key(text):
@@ -163,6 +169,7 @@ def fill_docx(src, dst, values):
     """ينسخ النموذج src إلى dst ويعمّر الكلمات المعلّمة في النص والجداول والـ header والـ footer."""
     if docx is None:
         raise RuntimeError("مكتبة python-docx غير مثبتة. نفّذ: pip install python-docx")
+    values = {k: xml_safe(v) for k, v in values.items()}
     mapping = {placeholder_key(k): v for k, v in values.items()}
     document = docx.Document(src)
     present = set()
@@ -716,7 +723,7 @@ _ODD_CHARS = re.compile(
 
 
 def repair_lines(lines, mode, vocab):
-    lines = [_ODD_CHARS.sub("", _CONTROL_CHARS.sub("", unicodedata.normalize("NFKC", line))).strip() for line in lines]
+    lines = [_ODD_CHARS.sub("", _CONTROL_CHARS.sub("", xml_safe(unicodedata.normalize("NFKC", line)))).strip() for line in lines]
     lines = [line for line in lines if line]
     if mode == "letters" or (mode == "auto" and looks_letter_reversed(lines, vocab)):
         lines = [_ARABIC_LETTERS.sub(lambda m: m.group(0)[::-1], line) for line in lines]
